@@ -32,6 +32,7 @@ Thumbs.db
 
 # ========== Data outputs (pipeline artifacts) ==========
 data/**
+!data/**/
 !data/**/.gitkeep
 
 # ========== IDE ==========

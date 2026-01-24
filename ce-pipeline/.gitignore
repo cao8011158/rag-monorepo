@@ -47,6 +47,7 @@ Thumbs.db
 data/**
 
 # 但保留目录结构占位文件
+!data/**/
 !data/**/.gitkeep
 
 # （可选）明确忽略常见产物类型
