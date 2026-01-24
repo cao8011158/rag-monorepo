@@ -1,0 +1,63 @@
+input:
+  input_store: fs_local
+  input_path: cleaned/documents.jsonl
+
+outputs:
+  chunks:
+    store: fs_local
+    base: ce_out/chunks
+  vector_index:
+    store: fs_local
+    base: ce_out/indexes/vector
+  bm25_index:
+    store: fs_local
+    base: ce_out/indexes/bm25
+
+stores:
+  fs_local:
+    kind: filesystem
+    root: data
+
+chunking:
+  window_chars: 1200
+  overlap_chars: 200
+  min_chunk_chars: 200
+
+processing:
+  dedup:
+    exact_dedup:
+      hash_field: chunk_text_hash
+
+    semantic_dedup:
+      enable: true
+
+      # cosine similarity threshold
+      threshold: 0.95
+
+      # ANN recall candidates
+      topk: 20
+
+      # HNSW index parameters
+      hnsw_m: 32
+      ef_construction: 200
+      ef_search: 128
+
+      # normalize embeddings so that inner product == cosine
+      normalize: true
+
+embedding:
+  model_name: "sentence-transformers/all-MiniLM-L6-v2"
+  device: null
+  batch_size: 64
+  normalize_embeddings: true
+  instructions:
+    passage: "passage: "
+    query: "query: "
+
+indexing:
+  bm25:
+    enabled: true
+  vector:
+    enabled: true
+    faiss_index: "FlatIP" # FlatIP on normalized vectors ~= cosine
+

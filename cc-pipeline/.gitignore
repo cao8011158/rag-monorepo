@@ -1,0 +1,42 @@
+# ========== Python ==========
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# ========== Virtual Env ==========
+.venv/
+venv/
+env/
+
+# ========== Pytest / coverage ==========
+.pytest_cache/
+.coverage
+htmlcov/
+
+# ========== Packaging ==========
+*.egg-info/
+dist/
+build/
+
+# ========== Environment ==========
+.env
+.env.*
+
+# ========== OS ==========
+.DS_Store
+Thumbs.db
+
+# ========== Logs ==========
+*.log
+
+# ========== Data outputs (pipeline artifacts) ==========
+data/**
+!data/**/.gitkeep
+
+# ========== IDE ==========
+.vscode/
+.idea/
+
+# ========== Cache ==========
+.cache/

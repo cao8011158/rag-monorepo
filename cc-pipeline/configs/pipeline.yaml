@@ -1,0 +1,31 @@
+project:
+  run_date: "auto" # auto -> today's date (YYYY-MM-DD)
+
+storage:
+  mode: "local" # local only for Module A
+  local_root: "data"
+
+crawl:
+  user_agent: "cc-pipeline-bot/0.1 (+course-assignment)"
+  timeout_sec: 30
+  max_retries: 3
+  per_host_rps: 1.0
+
+  # exploration
+  max_depth: 1
+  same_domain_only: true
+  allow_domains: []
+  max_links_per_page: 30
+  max_pages_total: 1000
+  max_pages_per_seed: 200
+
+clean:
+  min_text_chars: 300
+  output_jsonl: "data/cleaned/{run_date}/documents.jsonl"
+
+manifest:
+  latest_path: "data/manifests/latest.jsonl"
+  run_path: "data/manifests/{run_date}.jsonl"
+
+seeds:
+  path: "configs/seeds.yaml"

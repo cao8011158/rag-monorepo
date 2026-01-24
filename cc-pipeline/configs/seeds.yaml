@@ -1,0 +1,135 @@
+seeds:
+  - name: "Wikipedia Pittsburgh"
+    urls:
+      - "https://en.wikipedia.org/wiki/Pittsburgh"
+      - "https://en.wikipedia.org/wiki/History_of_Pittsburgh"
+
+  - name: "City of Pittsburgh"
+    urls:
+      # Main portal
+      - "https://www.pittsburghpa.gov/"
+
+      # -----------------------
+      # News
+      # -----------------------
+      - "https://www.pittsburghpa.gov/News-articles/Homepage"
+
+      # -----------------------
+      # Recreation & Events (UPDATED)
+      # (替换掉原 Resident-Services/Community-Programming/... 下失效的 Summer-Guide / Concerts)
+      # -----------------------
+      - "https://www.pittsburghpa.gov/Recreation-Events"
+
+      # -----------------------
+      # History & City Info
+      # -----------------------
+      - "https://www.pittsburghpa.gov/City-Government"
+
+      # -----------------------
+      # Finance, Budget & Regulations (UPDATED)
+      # (替换掉原 /finance 和 /finance/budget 这类旧路径)
+      # -----------------------
+      - "https://www.pittsburghpa.gov/City-Government/Finance-Budget"
+
+      # -----------------------
+      # Public Documents (PDF) (保留你原来的 PDF；另外补一个更稳定的 Summer Guide PDF)
+      # -----------------------
+      - "https://www.pittsburghpa.gov/files/assets/city/v/1/parks/documents/summer-guide-2025.pdf"
+      - "https://www.pittsburghpa.gov/files/assets/city/v/1/dcp/documents/nrb16a-complete.pdf"
+      - "https://www.pittsburghpa.gov/files/assets/city/v/1/dcp/documents/planning-commission/2025-meetings/03-11-2025-meeting/planning-commission-minutes-2023.pdf"
+      - "https://www.pittsburghpa.gov/files/assets/city/v/1/omb/documents/operating-budgets/8055_operating_budget_as_approved__by_council_12-17-193.pdf"
+
+  - name: "Visit Pittsburgh"
+    urls:
+      # -----------------------
+      # Home / Things to do
+      # -----------------------
+      - "https://www.visitpittsburgh.com/"
+
+      # -----------------------
+      # Events & Festivals
+      # -----------------------
+      - "https://www.visitpittsburgh.com/events-festivals/"
+      # -----------------------
+      # Attractions / Culture
+      # -----------------------
+      - "https://www.visitpittsburgh.com/things-to-do/free-things-to-do/"
+      - "https://www.visitpittsburgh.com/things-to-do/arts-culture/"
+
+      # -----------------------
+      # Dining & Culinary (UPDATED craft breweries)
+      # -----------------------
+      - "https://www.visitpittsburgh.com/restaurants-culinary/"
+
+      # -----------------------
+      # Plan Your Trip (UPDATED insider guide入口)
+      # -----------------------
+      - "https://www.visitpittsburgh.com/plan-your-trip/"
+
+      # -----------------------
+      # Sports (UPDATED)
+      # (替换掉原 /things-to-do/sports/ 这类不稳定入口)
+      # -----------------------
+      - "https://www.visitpittsburgh.com/sportspittsburgh/"
+
+      # -----------------------
+      # City highlight / stories
+      # -----------------------
+      - "https://www.visitpittsburgh.com/pittsburgh-will-surprise-you/"
+
+  - name: "Carnegie Mellon University (CMU)"
+    urls:
+      # Main CMU portal
+      - "https://www.cmu.edu/"
+      - "https://www.cmu.edu/about"
+
+      # -----------------------
+      # Leadership / Visit / Campus life (UPDATED)
+      # (替换掉 about/quick-facts.html, about/leadership.html, about/visit/, about/campus.html 等失效页面)
+      # -----------------------
+      - "https://www.cmu.edu/leadership"
+      - "https://www.cmu.edu/visit/"
+      - "https://www.cmu.edu/campus-life"
+
+      # -----------------------
+      # Academics (更稳：从 admission majors/programs 入口抓学校结构)
+      # -----------------------
+      - "https://www.cmu.edu/admission/majors-programs"
+
+      # -----------------------
+      # Research & Innovation (UPDATED)
+      # (替换掉 /research/ 与 /research/centers.html 这类可能变动的旧入口)
+      # -----------------------
+      - "https://www.cmu.edu/research-and-creativity"
+      - "https://www.cmu.edu/innovation/"
+
+      # -----------------------
+      # Events & News
+      # -----------------------
+      - "https://www.cmu.edu/events/"
+      - "https://events.cmu.edu/"
+      - "https://www.cmu.edu/news/"
+      - "https://www.cmu.edu/news/stories/"
+
+      # -----------------------
+      # Key schools (保留你原来的）
+      # -----------------------
+      - "https://www.cs.cmu.edu/index"
+      - "https://www.ri.cmu.edu/"
+      - "https://www.cmu.edu/tepper/"
+      - "https://www.cmu.edu/cfa/"
+      - "https://www.cmu.edu/engineering/"
+
+      # -----------------------
+      # Athletics (删掉 landing/index，保留主站)
+      # -----------------------
+      - "https://athletics.cmu.edu/"
+
+  - name: "Music and Culture – Pittsburgh"
+    urls:
+      - "https://trustarts.org"
+      - "https://carnegiemuseums.org"
+      - "https://www.heinzhistorycenter.org"
+      - "https://www.thefrickpittsburgh.org"
+      - "https://www.pittsburghsymphony.org"
+      - "https://pittsburghopera.org"
