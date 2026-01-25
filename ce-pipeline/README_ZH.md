@@ -21,11 +21,11 @@
 
 并严格遵循数据契约（Data Contract）设计。
 
-------------------------------------------------------------------------
+---
 
 # 目录结构（简化版）
 
-``` text
+```text
 ce_pipeline/
 ├── cli.py                 # CLI 入口
 ├── settings.py            # load_settings()
@@ -60,16 +60,16 @@ ce_pipeline/
     └── jsonl.py           # read_jsonl / append_jsonl
 ```
 
-------------------------------------------------------------------------
+---
 
 # 安装（Installation）
 
 ## 1. 环境要求
 
--   Python 3.10+
--   推荐使用虚拟环境
+- Python 3.10+
+- 推荐使用虚拟环境
 
-``` bash
+```bash
 python -m venv .venv
 source .venv/bin/activate   # Linux / macOS
 # .venv\Scripts\activate    # Windows
@@ -77,19 +77,19 @@ source .venv/bin/activate   # Linux / macOS
 
 ## 2. 安装依赖
 
-``` bash
+```bash
 pip install -r requirements.txt
 ```
 
 常见依赖包括：
 
--   numpy\
--   orjson\
--   faiss-cpu\
--   sentence-transformers\
--   rank-bm25
+- numpy\
+- orjson\
+- faiss-cpu\
+- sentence-transformers\
+- rank-bm25
 
-------------------------------------------------------------------------
+---
 
 # 配置说明（YAML）
 
@@ -97,7 +97,7 @@ pip install -r requirements.txt
 
 ## 1. 输入配置
 
-``` yaml
+```yaml
 input:
   input_store: fs_local
   input_path: cleaned/latest/documents.jsonl
@@ -105,17 +105,17 @@ input:
 
 说明：
 
--   `input_store`\
-    在 `stores` 中定义的存储名称
+- `input_store`\
+  在 `stores` 中定义的存储名称
 
--   `input_path`\
-    指向 `documents.jsonl` 的逻辑路径（POSIX 风格）
+- `input_path`\
+  指向 `documents.jsonl` 的逻辑路径（POSIX 风格）
 
-------------------------------------------------------------------------
+---
 
 ## 2. 输出配置
 
-``` yaml
+```yaml
 outputs:
   chunks:
     store: fs_local
@@ -132,25 +132,25 @@ outputs:
 
 所有输出产物都会写入各自的 `base` 目录下。
 
-------------------------------------------------------------------------
+---
 
 ## 3. Store 配置
 
-``` yaml
+```yaml
 stores:
   fs_local:
     kind: filesystem
     root: .
 ```
 
--   逻辑路径相对于 `root` 解析
--   精确去重必须使用文件系统存储
+- 逻辑路径相对于 `root` 解析
+- 精确去重必须使用文件系统存储
 
-------------------------------------------------------------------------
+---
 
 ## 4. 分块配置（Chunking）
 
-``` yaml
+```yaml
 chunking:
   window_chars: 1200
   overlap_chars: 200
@@ -159,11 +159,11 @@ chunking:
 
 该配置应用于：文档 → 文本块 阶段。
 
-------------------------------------------------------------------------
+---
 
 ## 5. 向量化配置（Embedding）
 
-``` yaml
+```yaml
 embedding:
   model_name: sentence-transformers/all-MiniLM-L6-v2
   batch_size: 64
@@ -175,11 +175,11 @@ embedding:
 
 由 `DualInstructEmbedder` 使用。
 
-------------------------------------------------------------------------
+---
 
 ## 6. 去重配置（Deduplication）
 
-``` yaml
+```yaml
 processing:
   dedup:
     exact_dedup:
@@ -195,16 +195,16 @@ processing:
       normalize: true
 ```
 
--   精确去重：基于哈希，流式处理\
--   语义去重：基于 ANN + 余弦相似度
+- 精确去重：基于哈希，流式处理\
+- 语义去重：基于 ANN + 余弦相似度
 
-------------------------------------------------------------------------
+---
 
 # 数据契约（Data Contracts）
 
 ## 输入文档结构（documents.jsonl）
 
-``` json
+```json
 {
   "doc_id": "string",
   "text": "string",
@@ -218,11 +218,11 @@ processing:
 }
 ```
 
-------------------------------------------------------------------------
+---
 
 ## 文本块结构（chunks.jsonl）
 
-``` json
+```json
 {
   "chunk_id": "string",
   "doc_id": "string",
@@ -244,31 +244,33 @@ processing:
 
 下游阶段只依赖以下字段：
 
--   `chunk_id`
--   `chunk_text`
+- `chunk_id`
+- `chunk_text`
 
-------------------------------------------------------------------------
+---
 
 # 运行流水线（Running the Pipeline）
 
-``` bash
+```bash
 ce run --config configs/pipeline.yaml
 ```
 
 该命令将执行：
 
--   分块阶段（Chunking）
--   向量化阶段（Embedding）
--   BM25 索引阶段（Indexing）
+- 分块阶段（Chunking）
+- 向量化阶段（Embedding）
+- BM25 索引阶段（Indexing）
 
-------------------------------------------------------------------------
+---
 
 # 失败语义（Failure Semantics）
 
-  阶段        策略
-  ----------- -------------------------------------
-  Chunking    Best-effort（跳过坏数据并记录错误）
-  Embedding   Fail-fast（严格校验数据格式）
-  Indexing    Best-effort
+阶段 策略
+
+---
+
+Chunking Best-effort（跳过坏数据并记录错误）
+Embedding Fail-fast（严格校验数据格式）
+Indexing Best-effort
 
 默认策略适用于真实世界中的鲁棒数据处理。

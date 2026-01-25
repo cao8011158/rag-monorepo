@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+build/
+dist/
+
+# Env
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+
+# Outputs / data (keep folder structure via .gitkeep if desired)
+data/**
+
+# Logs
+*.log

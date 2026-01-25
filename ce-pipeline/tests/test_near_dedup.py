@@ -1,135 +1,201 @@
 from __future__ import annotations
 
-from typing import Callable, Any
+from pathlib import Path
+from typing import Any, Dict, List
 
 import numpy as np
 import pytest
 
-import ce_pipeline.processing.near_dedup as near_mod
+from ce_pipeline.io.jsonl import read_jsonl, write_jsonl
+from ce_pipeline.stores.registry import build_store_registry
 
 
-def _resolve_near_func() -> Callable[..., Any]:
+def _base_settings(tmp_path: Path) -> Dict[str, Any]:
     """
-    Try to locate the near/semantic dedup function from src/ce_pipeline/processing/near_dedup.py
-
-    Adjust here if your function name differs.
+    生成最小 settings：
+    - stores.fs_local.root 指到 pytest tmp_path/data
+    - outputs.chunks.base = ce_out/chunks
+    - semantic_dedup.enable 可在测试里改
     """
-    candidates = [
-        "near_dedup_by_ann_faiss",
-        "near_dedup_by_cosine",
-        "semantic_dedup",
-        "run_near_dedup",
+    return {
+        "stores": {
+            "fs_local": {
+                "kind": "filesystem",
+                "root": str(tmp_path / "data"),
+            }
+        },
+        "outputs": {
+            "chunks": {
+                "store": "fs_local",
+                "base": "ce_out/chunks",
+            }
+        },
+        "processing": {
+            "dedup": {
+                "semantic_dedup": {
+                    "enable": True,
+                    "threshold": 0.95,
+                    "topk": 20,
+                    "hnsw_m": 32,
+                    "ef_construction": 200,
+                    "ef_search": 64,
+                    "normalize": True,
+                }
+            }
+        },
+    }
+
+
+def _read_all(store, posix_path: str) -> List[Dict[str, Any]]:
+    return list(read_jsonl(store, posix_path, on_error=None))
+
+
+def test_near_dedup_prune_raises_on_count_mismatch_and_does_not_overwrite(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    ✅ 新逻辑：chunks 行数 != emb 行数 => 直接抛错终止，并且不覆盖写回 chunks.jsonl
+    """
+    import ce_pipeline.processing.near_dedup as nd
+
+    s = _base_settings(tmp_path)
+    stores = build_store_registry(s)
+    store = stores["fs_local"]
+
+    chunks_path = "ce_out/chunks/chunks.jsonl"
+
+    # chunks：3 行
+    rows = [
+        {"chunk_id": "c1", "chunk_text": "a"},
+        {"chunk_id": "c2", "chunk_text": "b"},
+        {"chunk_id": "c3", "chunk_text": "c"},
     ]
-    for name in candidates:
-        fn = getattr(near_mod, name, None)
-        if callable(fn):
-            return fn
+    write_jsonl(store, chunks_path, rows)
 
-    raise AssertionError(
-        "Cannot find a near/semantic dedup function in ce_pipeline.processing.near_dedup.\n"
-        f"Tried: {candidates}\n"
-        "Fix: rename your function to one of these, OR edit _resolve_near_func() in this test."
+    # emb：2 行（故意 mismatch）
+    emb = np.random.randn(2, 4).astype(np.float32)
+
+    # patch near_dedup_by_ann_faiss：返回 removed_mask 长度=2（与 emb 对齐）
+    fake_res = nd.ANNDedupResult(
+        kept_indices=[0, 1],
+        removed_mask=np.array([False, False], dtype=bool),
+        num_kept=2,
+        num_removed=0,
     )
+    monkeypatch.setattr(nd, "near_dedup_by_ann_faiss", lambda *args, **kwargs: fake_res)
+
+    before = _read_all(store, chunks_path)
+
+    with pytest.raises(ValueError) as ei:
+        nd.near_dedup_and_prune_chunks(
+            s=s,
+            emb=emb,
+            chunks_filename="chunks.jsonl",
+            on_read_error=None,  # fail-fast 读（更容易暴露问题）
+        )
+
+    msg = str(ei.value).lower()
+    assert "mismatch" in msg
+    # 下面两条取决于你 ValueError 文案；如果你没写这两个字段，可以删掉
+    assert "chunks_rows=3" in msg
+    assert "emb_rows=2" in msg
+
+    after = _read_all(store, chunks_path)
+    assert after == before, "mismatch 时必须不写回（保持 chunks.jsonl 原样）"
 
 
-def _has_faiss() -> bool:
-    try:
-        import faiss  # noqa: F401
-        return True
-    except Exception:
-        return False
-
-
-def test_near_dedup_input_must_be_2d() -> None:
-    fn = _resolve_near_func()
-    with pytest.raises(ValueError):
-        fn(np.array([1.0, 2.0], dtype=np.float32))
-
-
-def test_near_dedup_removes_later_duplicate_when_embeddings_identical() -> None:
+def test_near_dedup_prune_overwrites_when_count_matches(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """
-    Works for both:
-    - ANN-based dedup implementations
-    - brute cosine-based dedup implementations
-
-    Expected: keep first occurrence and remove later duplicates.
+    ✅ chunks 行数 == emb 行数 => 允许覆盖写回，按 removed_mask 删除重复行
     """
-    fn = _resolve_near_func()
+    import ce_pipeline.processing.near_dedup as nd
 
-    # 0 and 1 identical; 2 orthogonal
-    emb = np.array(
-        [
-            [1.0, 0.0],
-            [1.0, 0.0],  # dup of 0
-            [0.0, 1.0],
-        ],
-        dtype=np.float32,
+    s = _base_settings(tmp_path)
+    stores = build_store_registry(s)
+    store = stores["fs_local"]
+
+    chunks_path = "ce_out/chunks/chunks.jsonl"
+
+    rows = [
+        {"chunk_id": "c1", "chunk_text": "a"},
+        {"chunk_id": "c2", "chunk_text": "b"},
+        {"chunk_id": "c3", "chunk_text": "c"},
+    ]
+    write_jsonl(store, chunks_path, rows)
+
+    emb = np.random.randn(3, 4).astype(np.float32)
+
+    # 删除 idx=1
+    fake_res = nd.ANNDedupResult(
+        kept_indices=[0, 2],
+        removed_mask=np.array([False, True, False], dtype=bool),
+        num_kept=2,
+        num_removed=1,
+    )
+    monkeypatch.setattr(nd, "near_dedup_by_ann_faiss", lambda *args, **kwargs: fake_res)
+
+    res = nd.near_dedup_and_prune_chunks(
+        s=s,
+        emb=emb,
+        chunks_filename="chunks.jsonl",
+        on_read_error=None,
     )
 
-    # If function is ANN/FAISS-based and faiss isn't installed, skip.
-    if fn.__name__ in ("near_dedup_by_ann_faiss", "semantic_dedup") and not _has_faiss():
-        pytest.skip("FAISS not installed; skipping ANN near-dedup test.")
-        return
+    assert res.num_removed == 1
+    assert res.num_kept == 2
 
-    # Try calling with common signatures:
-    # 1) returns kept_indices list
-    # 2) returns a result object with kept_indices / removed_mask
-    # 3) returns indices list under other name
-    res = None
-    try:
-        res = fn(emb, threshold=0.999, topk=3, normalize=True)
-    except TypeError:
-        # maybe cosine-only function signature: (emb, threshold=...)
-        res = fn(emb, threshold=0.999)
-
-    # Interpret output
-    if isinstance(res, list):
-        kept = res
-        assert kept == [0, 2]
-    else:
-        kept = getattr(res, "kept_indices", None)
-        removed_mask = getattr(res, "removed_mask", None)
-        if kept is None:
-            # fallback: some impl returns (kept, removed_mask)
-            if isinstance(res, tuple) and len(res) >= 1 and isinstance(res[0], list):
-                kept = res[0]
-            else:
-                raise AssertionError(
-                    "Near dedup returned an unsupported result type. "
-                    "Expected list[int] or an object with kept_indices."
-                )
-
-        assert kept == [0, 2]
-
-        if removed_mask is not None:
-            assert removed_mask.tolist() == [False, True, False]
+    out = _read_all(store, chunks_path)
+    assert out == [rows[0], rows[2]]
 
 
-def test_near_dedup_no_removal_when_threshold_too_high() -> None:
-    fn = _resolve_near_func()
+def test_near_dedup_prune_noop_when_disabled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    ✅ enable=false => 不应修改 chunks.jsonl，并返回“全保留”
+    """
+    import ce_pipeline.processing.near_dedup as nd
 
-    emb = np.array(
-        [
-            [1.0, 0.0],
-            [0.999, 0.01],
-            [0.0, 1.0],
-        ],
-        dtype=np.float32,
+    s = _base_settings(tmp_path)
+    s["processing"]["dedup"]["semantic_dedup"]["enable"] = False
+
+    stores = build_store_registry(s)
+    store = stores["fs_local"]
+
+    chunks_path = "ce_out/chunks/chunks.jsonl"
+
+    rows = [
+        {"chunk_id": "c1", "chunk_text": "a"},
+        {"chunk_id": "c2", "chunk_text": "b"},
+    ]
+    write_jsonl(store, chunks_path, rows)
+
+    emb = np.random.randn(2, 4).astype(np.float32)
+
+    # enable=false 时不应调用 near_dedup_by_ann_faiss
+    called = {"v": False}
+
+    def _fake(*args, **kwargs):
+        called["v"] = True
+        raise AssertionError("near_dedup_by_ann_faiss 不应在 enable=false 时被调用")
+
+    monkeypatch.setattr(nd, "near_dedup_by_ann_faiss", _fake)
+
+    before = _read_all(store, chunks_path)
+    res = nd.near_dedup_and_prune_chunks(
+        s=s,
+        emb=emb,
+        chunks_filename="chunks.jsonl",
+        on_read_error=None,
     )
+    after = _read_all(store, chunks_path)
 
-    if fn.__name__ in ("near_dedup_by_ann_faiss", "semantic_dedup") and not _has_faiss():
-        pytest.skip("FAISS not installed; skipping ANN near-dedup test.")
-        return
-
-    try:
-        res = fn(emb, threshold=0.99999, topk=3, normalize=True)
-    except TypeError:
-        res = fn(emb, threshold=0.99999)
-
-    if isinstance(res, list):
-        assert res == [0, 1, 2]
-    else:
-        kept = getattr(res, "kept_indices", None)
-        if kept is None and isinstance(res, tuple) and len(res) >= 1 and isinstance(res[0], list):
-            kept = res[0]
-        assert kept == [0, 1, 2]
+    assert called["v"] is False
+    assert before == after
+    assert res.kept_indices == [0, 1]
+    assert res.num_kept == 2
+    assert res.num_removed == 0
+    assert res.removed_mask.shape == (2,)
+    assert bool(res.removed_mask.any()) is False

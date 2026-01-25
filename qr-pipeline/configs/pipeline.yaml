@@ -1,0 +1,48 @@
+# configs/pipeline.yaml
+
+input:
+  input_store: fs_local
+  # chunks.jsonl from ce-pipeline
+  input_path: ce_out/chunks/chunks.jsonl
+
+outputs:
+  queries:
+    store: fs_local
+    base: qr_out/queries
+  pairwise:
+    store: fs_local
+    base: qr_out/pairwise
+  logs:
+    store: fs_local
+    base: qr_out/logs
+
+stores:
+  fs_local:
+    kind: filesystem
+    root: data
+
+query_generation:
+  enable: true
+  # provider: "local_hf" | "hf_inference" | "openai" | "anthropic"
+  provider: "local_hf"
+  model_name: "Qwen/Qwen2.5-7B-Instruct"
+  device: "cuda"
+  batch_size: 8
+  max_new_tokens: 128
+  temperature: 0.2
+  top_p: 0.9
+  queries_per_chunk: 1
+  max_chunk_chars: 1800
+
+candidate_mining:
+  enable: false
+  # placeholder for later: use bm25/faiss to fetch topK candidates
+  topk: 20
+
+labeling:
+  enable: false
+  # placeholder for later: LLM judge to pick pos + hard negs from candidates
+  hard_negatives: 6
+
+export:
+  include_text: true
