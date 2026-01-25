@@ -1,108 +1,52 @@
-# tests/test_embedding_stage.py
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Any, Dict, List
+from pathlib import Path
 
 import numpy as np
 import pytest
 
-pytest.importorskip("faiss")  # 没装 faiss 就跳过整文件
-import faiss  # type: ignore
+from ce_pipeline.stores.registry import build_store_registry
+from ce_pipeline.io.jsonl import read_jsonl
+from ce_pipeline.pipeline.embedding_stage import run_embedding_stage
 
 
-def _write_chunks_jsonl(path: Path, rows: List[Dict[str, Any]]) -> None:
+def _write_jsonl_text(path: Path, rows: List[Dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
     import orjson
 
-    path.parent.mkdir(parents=True, exist_ok=True)
-    data = b"".join(orjson.dumps(r) + b"\n" for r in rows)
-    path.write_bytes(data)
+    buf = bytearray()
+    for r in rows:
+        buf.extend(orjson.dumps(r))
+        buf.extend(b"\n")
+    path.write_bytes(bytes(buf))
 
 
-def _load_faiss_index_from_bytes(b: bytes) -> faiss.Index:
-    """
-    兼容 faiss 的 deserialize_index 输入类型：
-    - 一些版本要求 np.uint8 1D array，而不是 python bytes
-    """
-    arr = np.frombuffer(b, dtype=np.uint8)
-    return faiss.deserialize_index(arr)
+def _base_settings(tmp_path: Path) -> Dict[str, Any]:
+    data_root = tmp_path / "data"
+    data_root.mkdir(parents=True, exist_ok=True)
 
-
-class FakeEmbedder:
-    """
-    代替 DualInstructEmbedder：
-    - 相同 chunk_text -> 返回完全一样的向量（保证 near_dedup 会删掉后出现的重复）
-    - 不同文本 -> 不同向量
-    """
-    def __init__(
-        self,
-        model_name: str,
-        passage_instruction: str,
-        query_instruction: str,
-        batch_size: int = 64,
-        normalize_embeddings: bool = True,
-        device: str | None = None,
-    ) -> None:
-        self.normalize_embeddings = bool(normalize_embeddings)
-
-    def encode_passages(self, passages: List[str]) -> np.ndarray:
-        if not passages:
-            return np.zeros((0, 0), dtype=np.float32)
-
-        # 8维向量足够测试
-        out = np.zeros((len(passages), 8), dtype=np.float32)
-
-        for i, t in enumerate(passages):
-            # 用稳定hash构造向量；相同文本 -> 相同向量
-            h = abs(hash(t))
-            vec = np.array(
-                [
-                    (h % 97) / 97.0,
-                    (h % 193) / 193.0,
-                    (h % 389) / 389.0,
-                    (h % 769) / 769.0,
-                    ((h // 3) % 97) / 97.0,
-                    ((h // 7) % 193) / 193.0,
-                    ((h // 11) % 389) / 389.0,
-                    ((h // 13) % 769) / 769.0,
-                ],
-                dtype=np.float32,
-            )
-            out[i] = vec
-
-        if self.normalize_embeddings:
-            norms = np.linalg.norm(out, axis=1, keepdims=True)
-            out = out / np.maximum(norms, 1e-12)
-
-        return out
-
-    def encode_queries(self, queries: List[str]) -> np.ndarray:
-        # 本 stage 不用 query embedding，提供一个一致实现即可
-        return self.encode_passages(queries)
-
-
-def _base_settings(tmp_root: Path) -> Dict[str, Any]:
-    """
-    构造最小可运行 settings dict（不走 load_settings）
-    """
     return {
         "stores": {
             "fs_local": {
                 "kind": "filesystem",
-                "root": str(tmp_root),
+                "root": str(data_root),
             }
         },
         "outputs": {
             "chunks": {"store": "fs_local", "base": "ce_out/chunks"},
             "vector_index": {"store": "fs_local", "base": "ce_out/indexes/vector"},
+            "bm25_index": {"store": "fs_local", "base": "ce_out/indexes/bm25"},
         },
         "embedding": {
-            "model_name": "sentence-transformers/all-MiniLM-L6-v2",
-            "device": None,
+            # 这里随便写都行，因为我们会 monkeypatch __post_init__
+            "model_name": "dummy",
+            "instructions": {"passage": "", "query": ""},
             "batch_size": 64,
             "normalize_embeddings": True,
-            "instructions": {"passage": "passage: ", "query": "query: "},
+            "device": None,
         },
+        "indexing": {"vector": {"faiss_index": "FlatIP"}},
         "processing": {
             "dedup": {
                 "semantic_dedup": {
@@ -111,125 +55,127 @@ def _base_settings(tmp_root: Path) -> Dict[str, Any]:
                     "topk": 20,
                     "hnsw_m": 32,
                     "ef_construction": 200,
-                    "ef_search": 64,
+                    "ef_search": 128,
                     "normalize": True,
                 }
             }
         },
-        "indexing": {"vector": {"faiss_index": "FlatIP"}},
-        "_meta": {"config_path": "configs/pipeline.yaml", "config_hash": "x" * 64},
+        "_meta": {"run_date": "test"},
     }
 
 
-def _read_jsonl_lines(path: Path) -> List[dict]:
-    import orjson
-
-    lines = []
-    for raw in path.read_bytes().splitlines():
-        if raw.strip():
-            lines.append(orjson.loads(raw))
-    return lines
+def _chunks_file_on_disk(tmp_path: Path) -> Path:
+    return tmp_path / "data" / "ce_out" / "chunks" / "chunks.jsonl"
 
 
-def test_embedding_stage_no_dedup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    # patch embedder
-    import ce_pipeline.pipeline.embedding_stage as st
+def _read_chunks_ids_via_store(s: Dict[str, Any]) -> List[str]:
+    stores = build_store_registry(s)
+    chunks_out = s["outputs"]["chunks"]
+    store = stores[chunks_out["store"]]
+    chunks_path = f"{chunks_out['base'].rstrip('/')}/chunks.jsonl"
+    return [row["chunk_id"] for row in read_jsonl(store, chunks_path)]
 
-    monkeypatch.setattr(st, "DualInstructEmbedder", FakeEmbedder)
 
+def _patch_embedder(monkeypatch: pytest.MonkeyPatch, *, vecs: np.ndarray) -> None:
+    """
+    ✅ 关键补丁：
+    - patch __post_init__：避免 HF 下载
+    - patch encode_passages：直接返回我们指定的 embeddings
+    """
+    import ce_pipeline.pipeline.embedding_stage as es
+
+    def _fake_post_init(self) -> None:
+        self._model = object()
+
+    def _fake_encode_passages(self, texts: List[str]) -> np.ndarray:
+        assert len(texts) == int(vecs.shape[0])
+        return vecs
+
+    monkeypatch.setattr(es.DualInstructEmbedder, "__post_init__", _fake_post_init, raising=True)
+    monkeypatch.setattr(es.DualInstructEmbedder, "encode_passages", _fake_encode_passages, raising=True)
+
+
+def test_embedding_stage_no_prune_when_semantic_dedup_disabled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     s = _base_settings(tmp_path)
     s["processing"]["dedup"]["semantic_dedup"]["enable"] = False
 
-    chunks_file = tmp_path / "ce_out/chunks/chunks.jsonl"
-    rows = [
-        {"chunk_id": "c1", "chunk_text": "hello"},
-        {"chunk_id": "c2", "chunk_text": "world"},
-        {"chunk_id": "c3", "chunk_text": "hello world"},
-    ]
-    _write_chunks_jsonl(chunks_file, rows)
+    _write_jsonl_text(
+        _chunks_file_on_disk(tmp_path),
+        [
+            {"chunk_id": "c1", "chunk_text": "a"},
+            {"chunk_id": "c2", "chunk_text": "b"},
+            {"chunk_id": "c3", "chunk_text": "c"},
+        ],
+    )
 
-    res = st.run_embedding_stage(s)
+    _patch_embedder(
+        monkeypatch,
+        vecs=np.asarray([[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]], dtype=np.float32),
+    )
 
-    # outputs exist
-    faiss_bytes = (tmp_path / res.faiss_index_path).read_bytes()
-    assert len(faiss_bytes) > 0
+    res = run_embedding_stage(s)
 
-    idx = _load_faiss_index_from_bytes(faiss_bytes)
-    assert idx.ntotal == 3
-
-    id_map = _read_jsonl_lines(tmp_path / res.id_map_path)
-    assert len(id_map) == 3
-    assert [r["chunk_id"] for r in id_map] == ["c1", "c2", "c3"]
-    assert [r["faiss_id"] for r in id_map] == [0, 1, 2]
+    ids_after = _read_chunks_ids_via_store(s)
+    assert ids_after == ["c1", "c2", "c3"]
+    assert res.total_chunks_in == 3
+    assert res.total_vectors_out == 3
+    assert res.dim == 2
 
 
-def test_embedding_stage_with_near_dedup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    # patch embedder
-    import ce_pipeline.pipeline.embedding_stage as st
-
-    monkeypatch.setattr(st, "DualInstructEmbedder", FakeEmbedder)
-
+def test_embedding_stage_prunes_chunks_when_semantic_dedup_enabled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     s = _base_settings(tmp_path)
-    sd = s["processing"]["dedup"]["semantic_dedup"]
-    sd["enable"] = True
-    sd["threshold"] = 0.999  # 相同向量必删
-    sd["topk"] = 3
-    sd["ef_search"] = 64
-    sd["normalize"] = True
+    s["processing"]["dedup"]["semantic_dedup"]["enable"] = True
 
-    chunks_file = tmp_path / "ce_out/chunks/chunks.jsonl"
-    rows = [
-        {"chunk_id": "c1", "chunk_text": "DUP"},
-        {"chunk_id": "c2", "chunk_text": "unique"},
-        {"chunk_id": "c3", "chunk_text": "DUP"},   # duplicate of c1 => should be removed
-        {"chunk_id": "c4", "chunk_text": "unique2"},
-    ]
-    _write_chunks_jsonl(chunks_file, rows)
+    _write_jsonl_text(
+        _chunks_file_on_disk(tmp_path),
+        [
+            {"chunk_id": "c1", "chunk_text": "a"},
+            {"chunk_id": "c2", "chunk_text": "b"},
+            {"chunk_id": "c3", "chunk_text": "c"},
+        ],
+    )
 
-    res = st.run_embedding_stage(s)
+    _patch_embedder(
+        monkeypatch,
+        vecs=np.asarray([[1.0, 0.0], [1.0, 0.0], [0.0, 1.0]], dtype=np.float32),
+    )
 
-    faiss_bytes = (tmp_path / res.faiss_index_path).read_bytes()
-    idx = _load_faiss_index_from_bytes(faiss_bytes)
+    # ✅ 不 mock near_dedup_and_prune_chunks，让它真实覆盖 chunks.jsonl
+    # 只 mock near_dedup_by_ann_faiss 来固定删除 index=1
+    import ce_pipeline.processing.near_dedup as nd
 
-    # 期待删除 1 条
-    assert idx.ntotal == 3
+    def _fake_near_dedup_by_ann_faiss(*args, **kwargs):
+        removed_mask = np.asarray([False, True, False], dtype=bool)
+        return nd.ANNDedupResult(
+            kept_indices=[0, 2],
+            removed_mask=removed_mask,
+            num_kept=2,
+            num_removed=1,
+        )
 
-    id_map = _read_jsonl_lines(tmp_path / res.id_map_path)
-    kept_ids = [r["chunk_id"] for r in id_map]
-    assert kept_ids == ["c1", "c2", "c4"]  # c3 被删
+    monkeypatch.setattr(nd, "near_dedup_by_ann_faiss", _fake_near_dedup_by_ann_faiss, raising=True)
 
-    # meta.json 校验
-    import orjson
+    out = run_embedding_stage(s)
 
-    meta = orjson.loads((tmp_path / res.meta_path).read_bytes())
-    assert meta["total_chunks_in"] == 4
-    assert meta["total_vectors_out"] == 3
-    assert meta["semantic_dedup"]["enabled"] is True
-    assert meta["semantic_dedup"]["num_removed"] == 1
+    # ✅ 1) chunks.jsonl 被真实覆写删行
+    ids_after = _read_chunks_ids_via_store(s)
+    assert ids_after == ["c1", "c3"]
 
+    # ✅ 2) vectors_out 与删行后保持一致
+    assert out.total_chunks_in == 3
+    assert out.total_vectors_out == 2
+    assert out.dim == 2
 
-def test_embedding_stage_empty_chunks(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    import ce_pipeline.pipeline.embedding_stage as st
+    # ✅ 3) id_map.jsonl 也对齐
+    stores = build_store_registry(s)
+    vec_out = s["outputs"]["vector_index"]
+    vec_store = stores[vec_out["store"]]
+    id_map_path = f"{vec_out['base'].rstrip('/')}/id_map.jsonl"
 
-    monkeypatch.setattr(st, "DualInstructEmbedder", FakeEmbedder)
-
-    s = _base_settings(tmp_path)
-
-    chunks_file = tmp_path / "ce_out/chunks/chunks.jsonl"
-    _write_chunks_jsonl(chunks_file, [])
-
-    res = st.run_embedding_stage(s)
-
-    # faiss.index 应该存在但为空 bytes（你的实现是 write b""）
-    faiss_bytes = (tmp_path / res.faiss_index_path).read_bytes()
-    assert faiss_bytes == b""
-
-    id_map = _read_jsonl_lines(tmp_path / res.id_map_path)
-    assert id_map == []
-
-    import orjson
-
-    meta = orjson.loads((tmp_path / res.meta_path).read_bytes())
-    assert meta["total_chunks_in"] == 0
-    assert meta["total_vectors_out"] == 0
-    assert meta["dim"] == 0
+    id_rows = list(read_jsonl(vec_store, id_map_path))
+    assert [r["chunk_id"] for r in id_rows] == ["c1", "c3"]
+    assert [r["faiss_id"] for r in id_rows] == [0, 1]

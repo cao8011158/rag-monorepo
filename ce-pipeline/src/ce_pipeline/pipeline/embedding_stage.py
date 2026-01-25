@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List
 
 import time
 
@@ -15,7 +15,8 @@ from ce_pipeline.stores.registry import build_store_registry
 from ce_pipeline.io.jsonl import read_jsonl
 from ce_pipeline.embedding import DualInstructEmbedder
 
-from ce_pipeline.processing.near_dedup import near_dedup_by_ann_faiss
+# ✅ 更新：使用你新的接口
+from ce_pipeline.processing.near_dedup import near_dedup_and_prune_chunks
 from ce_pipeline.indexing.vector import build_faiss_index
 
 
@@ -39,15 +40,16 @@ class EmbeddingStageResult:
 
 def run_embedding_stage(s: Dict[str, Any]) -> EmbeddingStageResult:
     """
-    Embedding Stage: chunks.jsonl -> embeddings -> near_dedup -> faiss.index + id_map
+    Embedding Stage: chunks.jsonl -> embeddings -> near_dedup(prune chunks) -> faiss.index + id_map
 
     Reads:
       - chunks: outputs.chunks.{store, base}/chunks.jsonl
 
-    Writes (outputs.vector_index.base):
-      - faiss.index          (FAISS index bytes)
-      - id_map.jsonl         (faiss_id -> chunk_id)
-      - meta.json            (run metadata)
+    Writes:
+      - (可能覆盖) outputs.chunks.{store, base}/chunks.jsonl  (semantic near-dedup 同步删除)
+      - outputs.vector_index.base/faiss.index
+      - outputs.vector_index.base/id_map.jsonl
+      - outputs.vector_index.base/meta.json
 
     Required chunk fields (from chunks.jsonl):
       - chunk_id: str
@@ -69,7 +71,9 @@ def run_embedding_stage(s: Dict[str, Any]) -> EmbeddingStageResult:
     chunks_base = str(chunks_out["base"])
     vec_base = str(vec_out["base"])
 
-    chunks_path = _join_posix(chunks_base, "chunks.jsonl")
+    chunks_filename = "chunks.jsonl"
+    chunks_path = _join_posix(chunks_base, chunks_filename)
+
     faiss_index_path = _join_posix(vec_base, FAISS_INDEX_NAME)
     id_map_path = _join_posix(vec_base, ID_MAP_NAME)
     meta_path = _join_posix(vec_base, META_NAME)
@@ -148,33 +152,29 @@ def run_embedding_stage(s: Dict[str, Any]) -> EmbeddingStageResult:
     # -------------------------
     vecs = embedder.encode_passages(texts)  # np.ndarray float32 [N, D]
     if not isinstance(vecs, np.ndarray) or vecs.ndim != 2:
-        raise RuntimeError(f"Embedder returned invalid embeddings: {type(vecs)} / {getattr(vecs, 'shape', None)}")
+        raise RuntimeError(
+            f"Embedder returned invalid embeddings: {type(vecs)} / {getattr(vecs, 'shape', None)}"
+        )
 
     n, dim = int(vecs.shape[0]), int(vecs.shape[1])
     if n != len(chunk_ids):
         raise RuntimeError(f"Embedding count mismatch: vecs={n}, chunk_ids={len(chunk_ids)}")
 
     # -------------------------
-    # near_dedup 
+    # near_dedup + prune chunks.jsonl (NEW)
     # -------------------------
-    sd = (((s.get("processing") or {}).get("dedup") or {}).get("semantic_dedup") or {})
-    enable_sd = bool(sd.get("enable", False))
+    # 你新的 near_dedup_and_prune_chunks 会自己从 s 里读取 semantic_dedup 配置，
+    # 并在允许时覆盖写回 outputs.chunks.base/chunks.jsonl。
+    # 这里 stage 只负责拿结果来过滤向量 & chunk_id，确保 index 与 chunk 文件同步。
+    res = near_dedup_and_prune_chunks(
+        s=s,
+        emb=vecs,
+        chunks_filename=chunks_filename,
+        on_read_error=None,
+    )
 
-    kept_indices = list(range(n))
-    removed_mask = np.zeros((n,), dtype=bool)
-
-    if enable_sd and n > 1:
-        res = near_dedup_by_ann_faiss(
-            vecs,
-            threshold=float(sd.get("threshold", 0.95)),
-            topk=int(sd.get("topk", 20)),
-            hnsw_m=int(sd.get("hnsw_m", 32)),
-            ef_construction=int(sd.get("ef_construction", 200)),
-            ef_search=int(sd.get("ef_search", 128)),
-            normalize=bool(sd.get("normalize", True)),
-        )
-        kept_indices = res.kept_indices
-        removed_mask = res.removed_mask
+    kept_indices = res.kept_indices
+    removed_mask = res.removed_mask
 
     kept_vecs = vecs[kept_indices]
     kept_ids = [chunk_ids[i] for i in kept_indices]
@@ -197,6 +197,10 @@ def run_embedding_stage(s: Dict[str, Any]) -> EmbeddingStageResult:
     id_rows = ({"faiss_id": i, "chunk_id": kept_ids[i]} for i in range(len(kept_ids)))
     _write_jsonl(vec_store, id_map_path, id_rows)
 
+    # （可选）把 semantic_dedup 配置也写进 meta 里，便于复现/排查
+    sd = (((s.get("processing") or {}).get("dedup") or {}).get("semantic_dedup") or {})
+    enable_sd = bool(sd.get("enable", False))
+
     meta = {
         "created_at_unix": int(time.time()),
         "chunks_path": chunks_path,
@@ -213,6 +217,7 @@ def run_embedding_stage(s: Dict[str, Any]) -> EmbeddingStageResult:
             "ef_search": int(sd.get("ef_search", 128)) if enable_sd else None,
             "normalize": bool(sd.get("normalize", True)) if enable_sd else None,
             "num_removed": int(removed_mask.sum()) if enable_sd else 0,
+            "num_kept": int(len(kept_indices)) if enable_sd else int(len(kept_indices)),
         },
         "_meta": s.get("_meta", {}),
         "_timing_sec": {"embedding_stage": round(time.time() - t0, 4)},
