@@ -1,13 +1,12 @@
 # hybrid retrieval , 对单条query, 同时使用fassi 和 BM25 , 从 chunks.jsonl 提取top-k档案 , 使用 RRF  进行融合, 
 # 输入为string (单条query)  输出为list[docmument](RRF 融合后的 top-k档案列)
-
 # src/qr_pipeline/llm/retrieval.py
 from __future__ import annotations
 
 import pickle
 import re
 from dataclasses import dataclass
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Tuple, Optional
 
 import numpy as np
 import faiss  # type: ignore
@@ -33,14 +32,25 @@ def _safe_float(x: Any, default: float = 0.0) -> float:
 
 
 def _deserialize_faiss_index(b: bytes):
-    if hasattr(faiss, "deserialize_index"):
-        return faiss.deserialize_index(b)
+    """
+    Robust FAISS index deserialization.
 
-    import tempfile
-    with tempfile.NamedTemporaryFile(suffix=".index", delete=True) as f:
-        f.write(b)
-        f.flush()
-        return faiss.read_index(f.name)
+    Newer faiss python bindings (e.g. faiss-cpu 1.13.x) expect a 1D numpy uint8 array
+    for deserialize_index. Passing raw bytes will crash with:
+      AttributeError: 'bytes' object has no attribute 'shape'
+    """
+    # Preferred path: deserialize from np.uint8 view (works for cpu/gpu bindings)
+    try:
+        arr = np.frombuffer(b, dtype=np.uint8)
+        return faiss.deserialize_index(arr)
+    except Exception:
+        # Fallback: some environments support reading from file
+        import tempfile
+
+        with tempfile.NamedTemporaryFile(suffix=".index", delete=True) as f:
+            f.write(b)
+            f.flush()
+            return faiss.read_index(f.name)
 
 
 def _rrf_fuse(
@@ -78,8 +88,8 @@ def _linear_fuse(
 class RetrievalArtifacts:
     chunks_rows: List[Dict[str, Any]]
     id_map_rows: List[Dict[str, Any]]
-    faiss_index: Any
-    bm25_obj: Any
+    faiss_index: Any  # can be None when mode=bm25
+    bm25_obj: Any     # can be None when mode=dense
 
     idx_to_chunk: List[Dict[str, Any]]
     idx_to_key: List[str]
@@ -117,12 +127,12 @@ class HybridRetriever:
         self.a = artifacts
         self.embedder = embedder
 
-        self.mode = mode
+        self.mode = str(mode)
         self.top_k = int(top_k)
         self.dense_top_k = int(dense_top_k)
         self.bm25_top_k = int(bm25_top_k)
 
-        self.fusion_method = fusion_method
+        self.fusion_method = str(fusion_method)
         self.rrf_k = int(rrf_k)
         self.w_dense = float(w_dense)
         self.w_bm25 = float(w_bm25)
@@ -148,36 +158,24 @@ class HybridRetriever:
         id_map_path = _posix_join(vec_cfg["base"], vec_cfg["id_map"])
         bm25_path = _posix_join(bm25_cfg["base"], bm25_cfg["bm25_pkl"])
 
+        # Read lightweight metadata first
         chunks_rows = list(read_jsonl(chunks_store, chunks_path))
         id_map_rows = list(read_jsonl(vec_store, id_map_path))
 
-        faiss_bytes = vec_store.read_bytes(faiss_path)
-        faiss_index = _deserialize_faiss_index(faiss_bytes)
-
-        bm25_bytes = bm25_store.read_bytes(bm25_path)
-        bm25_obj = pickle.loads(bm25_bytes)
-
+        # Build idx_to_key from id_map (vector row alignment)
         idx_to_key: List[str] = []
         for row in id_map_rows:
             key = row["chunk_id"]
             idx_to_key.append(str(key))
 
+        # IMPORTANT: validate mismatch BEFORE loading faiss/bm25
         if len(chunks_rows) != len(idx_to_key):
             raise ValueError("chunks.jsonl and id_map.jsonl length mismatch")
 
         idx_to_chunk = chunks_rows
         key_to_idx = {k: i for i, k in enumerate(idx_to_key)}
 
-        artifacts = RetrievalArtifacts(
-            chunks_rows=chunks_rows,
-            id_map_rows=id_map_rows,
-            faiss_index=faiss_index,
-            bm25_obj=bm25_obj,
-            idx_to_chunk=idx_to_chunk,
-            idx_to_key=idx_to_key,
-            key_to_idx=key_to_idx,
-        )
-
+        # Load embedder config
         emb_cfg = s["embedding"]
         instr = emb_cfg["instructions"]
         embedder = DualInstructEmbedder(
@@ -189,17 +187,40 @@ class HybridRetriever:
             device=emb_cfg.get("device"),
         )
 
+        # Retrieval config
         r = s["retrieval"]
-        mode = r["mode"]
-        top_k = r["top_k"]
-        dense_top_k = r["dense"]["top_k"]
-        bm25_top_k = r["bm25"]["top_k"]
+        mode = str(r["mode"])
+        top_k = int(r["top_k"])
+        dense_top_k = int(r["dense"]["top_k"])
+        bm25_top_k = int(r["bm25"]["top_k"])
 
         fusion = r["hybrid_fusion"]
-        method = fusion["method"]
-        rrf_k = fusion.get("rrf_k", 60)
-        w_dense = fusion.get("w_dense", 0.5)
-        w_bm25 = fusion.get("w_bm25", 0.5)
+        method = str(fusion["method"])
+        rrf_k = int(fusion.get("rrf_k", 60))
+        w_dense = float(fusion.get("w_dense", 0.5))
+        w_bm25 = float(fusion.get("w_bm25", 0.5))
+
+        # Lazy-load heavy artifacts based on mode
+        faiss_index: Optional[Any] = None
+        bm25_obj: Optional[Any] = None
+
+        if mode in {"dense", "hybrid"}:
+            faiss_bytes = vec_store.read_bytes(faiss_path)
+            faiss_index = _deserialize_faiss_index(faiss_bytes)
+
+        if mode in {"bm25", "hybrid"}:
+            bm25_bytes = bm25_store.read_bytes(bm25_path)
+            bm25_obj = pickle.loads(bm25_bytes)
+
+        artifacts = RetrievalArtifacts(
+            chunks_rows=chunks_rows,
+            id_map_rows=id_map_rows,
+            faiss_index=faiss_index,
+            bm25_obj=bm25_obj,
+            idx_to_chunk=idx_to_chunk,
+            idx_to_key=idx_to_key,
+            key_to_idx=key_to_idx,
+        )
 
         return HybridRetriever(
             artifacts=artifacts,
@@ -272,14 +293,17 @@ class HybridRetriever:
     # Internal search
     # -----------------------------
     def _dense_search(self, query: str, top_k: int):
+        if self.a.faiss_index is None:
+            raise RuntimeError("Dense search requested but FAISS index is not loaded (mode mismatch).")
+
         qv = self.embedder.encode_queries([query]).astype(np.float32)
-        distances, indices = self.a.faiss_index.search(qv, top_k)
+        distances, indices = self.a.faiss_index.search(qv, int(top_k))
 
         ranked = []
         score_map = {}
 
         for j, idx in enumerate(indices[0], start=1):
-            key = self.a.idx_to_key[idx]
+            key = self.a.idx_to_key[int(idx)]
             score = float(distances[0][j - 1])
             ranked.append((key, j, score))
             score_map[key] = score
@@ -287,10 +311,16 @@ class HybridRetriever:
         return ranked, score_map
 
     def _bm25_search(self, query: str, top_k: int):
+        if self.a.bm25_obj is None:
+            raise RuntimeError("BM25 search requested but BM25 object is not loaded (mode mismatch).")
+
         toks = _simple_tokenize(query)
         scores = np.asarray(self.a.bm25_obj.get_scores(toks), dtype=np.float32)
 
-        k = min(top_k, len(scores))
+        k = min(int(top_k), len(scores))
+        if k <= 0:
+            return [], {}
+
         top_idx = np.argpartition(-scores, k - 1)[:k]
         top_idx_sorted = top_idx[np.argsort(-scores[top_idx])]
 
@@ -298,8 +328,8 @@ class HybridRetriever:
         score_map = {}
 
         for rank, idx in enumerate(top_idx_sorted, start=1):
-            key = self.a.idx_to_key[idx]
-            score = float(scores[idx])
+            key = self.a.idx_to_key[int(idx)]
+            score = float(scores[int(idx)])
             ranked.append((key, rank, score))
             score_map[key] = score
 
