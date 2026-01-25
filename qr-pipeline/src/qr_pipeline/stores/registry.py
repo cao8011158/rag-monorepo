@@ -5,28 +5,33 @@ from typing import Any, Dict
 
 from qr_pipeline.stores.base import Store
 from qr_pipeline.stores.filesystem import FilesystemStore
+from qr_pipeline.stores.object_storage import S3Store
 
 
 def build_store_registry(cfg: Dict[str, Any]) -> Dict[str, Store]:
-    """Build store instances from cfg['stores'].
-
-    Example:
-      stores:
-        fs_local:
-          kind: filesystem
-          root: data
-    """
-    stores_cfg = cfg.get("stores")
+    stores_cfg = cfg.get("stores", {})
     if not isinstance(stores_cfg, dict):
-        raise ValueError("cfg['stores'] must be a dict")
-    out: Dict[str, Store] = {}
+        raise ValueError("cfg.stores must be a mapping")
+
+    reg: Dict[str, Store] = {}
     for name, sc in stores_cfg.items():
         if not isinstance(sc, dict):
-            raise ValueError(f"stores.{name} must be a dict")
+            raise ValueError(f"Store '{name}' must be a mapping")
+
         kind = sc.get("kind")
         if kind == "filesystem":
-            root = sc.get("root", "data")
-            out[name] = FilesystemStore(Path(root))
+            root = sc.get("root", ".")
+            reg[name] = FilesystemStore(root=Path(root).resolve())
+        elif kind == "object_storage":
+            driver = sc.get("driver")
+            if driver != "s3":
+                raise ValueError(f"Unsupported object_storage driver: {driver}")
+            bucket = sc.get("bucket")
+            prefix = sc.get("prefix", "")
+            if not bucket:
+                raise ValueError("S3 store requires 'bucket'")
+            reg[name] = S3Store(bucket=bucket, prefix=prefix)
         else:
-            raise ValueError(f"Unsupported store kind: {kind!r} (store={name})")
-    return out
+            raise ValueError(f"Unsupported store kind: {kind}")
+
+    return reg

@@ -1,48 +1,162 @@
-# configs/pipeline.yaml
-
-input:
-  input_store: fs_local
-  # chunks.jsonl from ce-pipeline
-  input_path: ce_out/chunks/chunks.jsonl
-
-outputs:
-  queries:
-    store: fs_local
-    base: qr_out/queries
-  pairwise:
-    store: fs_local
-    base: qr_out/pairwise
-  logs:
-    store: fs_local
-    base: qr_out/logs
+# =========================
+# rq-pipeline config
+# Generate reranker training data:
+# 6500 chunks -> 2000 queries -> retrieval top-k -> 1 pos + 6 hard neg -> ~12k pairs
+# =========================
 
 stores:
   fs_local:
     kind: filesystem
     root: data
 
+# ---------- Inputs: ce-pipeline artifacts ----------
+inputs:
+  ce_artifacts:
+    chunks:
+      store: fs_local
+      base: ce_out/chunks
+      chunks_file: chunks.jsonl
+
+    vector_index:
+      store: fs_local
+      base: ce_out/indexes/vector
+      faiss_index: faiss.index
+      id_map: id_map.jsonl
+
+    bm25_index:
+      store: fs_local
+      base: ce_out/indexes/bm25
+      bm25_pkl: bm25.pkl
+
+# ---------- Outputs ----------
+outputs:
+  store: fs_local
+  base: rq_out
+
+  files:
+    queries_in_domain: queries/in_domain.jsonl
+    queries_out_domain: queries/out_domain.jsonl
+    candidates: retrieval_candidates.jsonl
+    pairs: pairs.pairwise.train.jsonl
+    stats: run_stats.json
+    errors: errors.jsonl
+
+# ---------- Models ----------
+models:
+  # LLM for query generation
+  llm:
+    provider: hf_transformers # or vllm / hf_inference / openai (if you support)
+    model_name: Qwen2.5-7B-Instruct
+    device: cuda # cpu/cuda
+    cache_dir: data/.hf_cache
+    max_new_tokens: 128
+    temperature: 0.7
+    top_p: 0.9
+
+  #embedder for dense retrieval queries (only if rq-pipeline needs to embed queries)
+  embedding:
+    model_name: "sentence-transformers/all-MiniLM-L6-v2"
+    device: null # "cpu" / "cuda" / None(auto)
+    batch_size: 64
+    cache_dir: data/.hf_cache
+    normalize_embeddings: true
+    instructions:
+      passage: "passage: "
+      query: "query: "
+
+# ---------- Query generation ----------
 query_generation:
-  enable: true
-  # provider: "local_hf" | "hf_inference" | "openai" | "anthropic"
-  provider: "local_hf"
-  model_name: "Qwen/Qwen2.5-7B-Instruct"
-  device: "cuda"
-  batch_size: 8
-  max_new_tokens: 128
-  temperature: 0.2
-  top_p: 0.9
-  queries_per_chunk: 1
-  max_chunk_chars: 1800
+  target_num_queries: 2000
 
-candidate_mining:
-  enable: false
-  # placeholder for later: use bm25/faiss to fetch topK candidates
-  topk: 20
+  # how to sample chunks for query generation
+  sampling:
+    seed: 42
+    strategy: uniform_random # uniform_random | stratified_by_doc | per_doc_cap
+    max_chunks_considered: 6500 # cap if needed
 
-labeling:
-  enable: false
-  # placeholder for later: LLM judge to pick pos + hard negs from candidates
-  hard_negatives: 6
+  # prompt template (keep it configurable)
+  prompt:
+    language: en
+    style: "information-seeking"
+    num_queries_per_chunk: 3
+    max_chunk_chars: 2100
+    diversify: true
+    diversity_hints: |
+      ask about a specific fact (who/when/where);
+      ask about a definition or explanation (what/why);
+      ask about a relationship/comparison (how differs / related to)
+    avoid_near_duplicates: true
 
-export:
-  include_text: true
+  # output constraints / cleanup
+  postprocess:
+    min_query_chars: 8
+    max_query_chars: 200
+
+  # nromalization
+  normalize:
+    lower: true # "CMU" -> "cmu"
+    strip: true # remove leading/trailing spaces
+    collapse_whitespace: true # "a   b\nc" -> "a b c"
+
+# ---------- Query processing ----------
+processing:
+  dedup:
+    # -------------------------
+    #  Semantic dedup (ANN + cosine)
+    # -------------------------
+    semantic_dedup:
+      enable: true
+
+      # cosine similarity threshold
+      threshold: 0.95
+
+      # ANN recall candidates
+      topk: 50
+
+      # HNSW index parameters
+      hnsw_m: 32
+      ef_construction: 200
+      ef_search: 128
+
+      # normalize embeddings so that inner product == cosine
+      normalize: true
+
+      # ---- safety / stability (recommended) ----
+      min_text_chars: 20 # skip semantic dedup for very short queries
+      keep_strategy: longest # keep the most informative wording in a dup group
+      max_remove_ratio: 0.5 # avoid deleting too aggressively
+
+# ---------- Retrieval ----------
+retrieval:
+  mode: hybrid # dense | bm25 | hybrid
+  top_k: 30 # candidates pool per query
+
+  dense:
+    top_k: 30
+
+  bm25:
+    top_k: 60
+
+  hybrid_fusion:
+    method: rrf # rrf | linear
+    rrf_k: 60
+    # if linear, you can add weights:
+    # w_dense: 0.5
+    # w_bm25: 0.5
+
+# ---------- Pair construction ----------
+pair_construction:
+  positive:
+    strategy: source_chunk # source_chunk | best_ranked | threshold_match
+    # when strategy=threshold_match:
+    # min_cosine: 0.85
+
+  hard_negatives:
+    num_per_query: 6
+    strategy: top_rank_excluding_pos # top_rank_excluding_pos | score_band | mixed
+    # avoid false negatives that are too similar to positive
+    filters:
+      enable_similarity_filter: true
+      max_cosine_with_positive: 0.92
+      # optional: also avoid near-duplicate negatives
+      enable_text_hash_dedup: true

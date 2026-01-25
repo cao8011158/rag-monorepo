@@ -1,12 +1,17 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from typing import Iterable
 
 
-class Store(ABC):
-    """Minimal Store interface (filesystem / object storage compatible)."""
+@dataclass(frozen=True)
+class StorePath:
+    # Logical path inside a store (posix-like).
+    path: str
 
+
+class Store(ABC):
     @abstractmethod
     def exists(self, path: str) -> bool: ...
 
@@ -14,13 +19,13 @@ class Store(ABC):
     def read_text(self, path: str, encoding: str = "utf-8") -> str: ...
 
     @abstractmethod
-    def write_text(self, path: str, data: str, encoding: str = "utf-8") -> None: ...
+    def write_text(self, path: str, content: str, encoding: str = "utf-8") -> None: ...
 
     @abstractmethod
     def read_bytes(self, path: str) -> bytes: ...
 
     @abstractmethod
-    def write_bytes(self, path: str, data: bytes) -> None: ...
+    def write_bytes(self, path: str, content: bytes) -> None: ...
 
     @abstractmethod
-    def list(self, prefix: str = "") -> Iterable[str]: ...
+    def list(self, prefix: str) -> Iterable[str]: ...

@@ -25,11 +25,11 @@ dev = [
 ]
 
 # Optional (when you add local LLM inference):
-# llm = [
-#   "torch>=2.2.0",
-#   "transformers>=4.41.0",
-#   "accelerate>=0.30.0",
-# ]
+llm = [
+  "torch>=2.2.0",
+  "transformers>=4.41.0",
+  "accelerate>=0.30.0",
+]
 
 [project.scripts]
 qr = "qr_pipeline.cli:main"
@@ -39,3 +39,11 @@ package-dir = {"" = "src"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+retrieval = [
+  "faiss-cpu>=1.7.4",
+]
+
+retrieval-gpu = [
+  "faiss-gpu>=1.7.4",
+]
