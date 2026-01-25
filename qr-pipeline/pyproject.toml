@@ -8,8 +8,8 @@ version = "0.1.0"
 description = "Query generation + (query, pos, neg) dataset builder for reranker fine-tuning."
 readme = "README.md"
 requires-python = ">=3.10"
-license = {text = "MIT"}
-authors = [{name = "Your Name"}]
+license = { text = "MIT" }
+authors = [{ name = "Your Name" }]
 dependencies = [
   "pyyaml>=6.0.1",
   "orjson>=3.10.0",
@@ -31,15 +31,7 @@ llm = [
   "accelerate>=0.30.0",
 ]
 
-[project.scripts]
-qr = "qr_pipeline.cli:main"
-
-[tool.setuptools]
-package-dir = {"" = "src"}
-
-[tool.setuptools.packages.find]
-where = ["src"]
-
+# Optional (retrieval backends):
 retrieval = [
   "faiss-cpu>=1.7.4",
 ]
@@ -47,3 +39,12 @@ retrieval = [
 retrieval-gpu = [
   "faiss-gpu>=1.7.4",
 ]
+
+[project.scripts]
+qr = "qr_pipeline.cli:main"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]

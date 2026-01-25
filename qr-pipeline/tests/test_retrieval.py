@@ -3,8 +3,9 @@ from __future__ import annotations
 
 import json
 import pickle
+import re
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Sequence, Union
 
 import numpy as np
 import pytest
@@ -43,15 +44,107 @@ def faiss_mod():
     return pytest.importorskip("faiss")
 
 
+# -----------------------------
+# Fake embedder for tests (NO downloads, fixed dim=4)
+# -----------------------------
+class FakeDualInstructEmbedder:
+    """
+    A drop-in replacement for DualInstructEmbedder used by retrieval.py.
+
+    Goal:
+      - Always output float32 embeddings with dim=4 (to match our test FAISS index)
+      - Deterministic: same input -> same vector
+      - Simple semantics:
+          query about pittsburgh -> close to c0=[1,0,0,0]
+          query about CMU/carnegie mellon -> close to c1=[0.7,0.3,0,0]
+          query about tokyo/japan -> close to c2=[0,0,1,0]
+    """
+
+    dim = 4
+
+    def __init__(
+        self,
+        model_name: str,
+        passage_instruction: str,
+        query_instruction: str,
+        batch_size: int = 64,
+        normalize_embeddings: bool = True,
+        device: str | None = None,
+        **_: Any,
+    ) -> None:
+        self.model_name = model_name
+        self.passage_instruction = passage_instruction
+        self.query_instruction = query_instruction
+        self.batch_size = batch_size
+        self.normalize_embeddings = normalize_embeddings
+        self.device = device
+
+    def _tokenize(self, s: str) -> List[str]:
+        return re.findall(r"[A-Za-z0-9]+", s.lower())
+
+    def _vec_for_text(self, text: str) -> np.ndarray:
+        toks = set(self._tokenize(text))
+
+        # match test corpus intent
+        if {"carnegie", "mellon", "university", "cmu"} & toks:
+            v = np.array([0.7, 0.3, 0.0, 0.0], dtype=np.float32)  # like c1
+        elif {"tokyo", "japan", "capital"} & toks:
+            v = np.array([0.0, 0.0, 1.0, 0.0], dtype=np.float32)  # like c2
+        else:
+            v = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)  # like c0
+
+        if self.normalize_embeddings:
+            n = float(np.linalg.norm(v))
+            if n > 0:
+                v = v / n
+        return v
+
+    def embed_query(self, text: str) -> np.ndarray:
+        # return shape [D]
+        return self._vec_for_text(text)
+
+    def embed_queries(self, texts: Sequence[str]) -> np.ndarray:
+        # return shape [N, D]
+        out = np.stack([self._vec_for_text(t) for t in texts], axis=0).astype(np.float32)
+        return out
+
+    def embed_passage(self, text: str) -> np.ndarray:
+        return self._vec_for_text(text)
+
+    def embed_passages(self, texts: Sequence[str]) -> np.ndarray:
+        out = np.stack([self._vec_for_text(t) for t in texts], axis=0).astype(np.float32)
+        return out
+
+    # common alias in sentence-transformers style
+    def encode(
+        self,
+        sentences: Union[str, Sequence[str]],
+        **__: Any,
+    ) -> np.ndarray:
+        if isinstance(sentences, str):
+            # sentence-transformers returns 1D for single str
+            return self._vec_for_text(sentences)
+        return self.embed_queries(list(sentences))
+
+
+def _patch_embedder(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    Patch the retrieval module's DualInstructEmbedder symbol so that:
+      HybridRetriever.from_settings(...) uses FakeDualInstructEmbedder.
+    """
+    import qr_pipeline.llm.retrieval as r
+
+    monkeypatch.setattr(r, "DualInstructEmbedder", FakeDualInstructEmbedder, raising=True)
+
+
 @pytest.fixture()
 def ce_artifacts_on_disk(tmp_path: Path, faiss_mod):
     """
     Create CE artifacts on disk under:
       <tmp_path>/ce_out/...
 
-    Matches your config:
-      base: ce_out/...
-    and uses fs_local.root = <tmp_path>
+    Uses a SMALL deterministic FAISS index with dim=4.
+    Our FakeDualInstructEmbedder outputs dim=4 too.
     """
     base_dir = tmp_path / "ce_out"
 
@@ -89,6 +182,8 @@ def ce_artifacts_on_disk(tmp_path: Path, faiss_mod):
         ],
         dtype=np.float32,
     )
+    # normalize to match FakeDualInstructEmbedder(normalize_embeddings=True)
+    xb = xb / np.linalg.norm(xb, axis=1, keepdims=True)
     index = faiss_mod.IndexFlatIP(4)
     index.add(xb)
     faiss_path.parent.mkdir(parents=True, exist_ok=True)
@@ -110,27 +205,11 @@ def ce_artifacts_on_disk(tmp_path: Path, faiss_mod):
 
 def _make_settings_like_your_yaml(tmp_root: Path) -> Dict[str, Any]:
     """
-    Build settings dict that matches your YAML (screenshot):
+    Build settings dict that matches your YAML-like structure.
 
-    stores:
-      fs_local:
-        kind: filesystem
-        root: data   (for tests -> tmp_root)
-    inputs:
-      ce_artifacts:
-        chunks:
-          store: fs_local
-          base: ce_out/chunks
-          chunks_file: chunks.jsonl
-        vector_index:
-          store: fs_local
-          base: ce_out/indexes/vector
-          faiss_index: faiss.index
-          id_map: id_map.jsonl
-        bm25_index:
-          store: fs_local
-          base: ce_out/indexes/bm25
-          bm25_pkl: bm25.pkl
+    NOTE:
+      The "embedding.model_name" here is irrelevant in route B because we monkeypatch
+      DualInstructEmbedder -> FakeDualInstructEmbedder (no downloads, dim=4).
     """
     return {
         "stores": {
@@ -160,8 +239,7 @@ def _make_settings_like_your_yaml(tmp_root: Path) -> Dict[str, Any]:
             }
         },
         "embedding": {
-            # NOTE: This will download on first run unless cached.
-            "model_name": "sentence-transformers/all-MiniLM-L6-v2",
+            "model_name": "intfloat/e5-base-v2",  # doesn't matter in route B
             "instructions": {"passage": "passage:", "query": "query:"},
             "batch_size": 4,
             "normalize_embeddings": True,
@@ -182,7 +260,9 @@ def _make_settings_like_your_yaml(tmp_root: Path) -> Dict[str, Any]:
     }
 
 
-def test_integration_from_settings_and_retrieve_hybrid_rrf(ce_artifacts_on_disk):
+def test_integration_from_settings_and_retrieve_hybrid_rrf(ce_artifacts_on_disk, monkeypatch: pytest.MonkeyPatch):
+    _patch_embedder(monkeypatch)
+
     import qr_pipeline.llm.retrieval as r
 
     s = _make_settings_like_your_yaml(ce_artifacts_on_disk["tmp_root"])
@@ -205,7 +285,9 @@ def test_integration_from_settings_and_retrieve_hybrid_rrf(ce_artifacts_on_disk)
     assert out[0]["rrf_score"] >= out[1]["rrf_score"]
 
 
-def test_integration_dense_only(ce_artifacts_on_disk):
+def test_integration_dense_only(ce_artifacts_on_disk, monkeypatch: pytest.MonkeyPatch):
+    _patch_embedder(monkeypatch)
+
     import qr_pipeline.llm.retrieval as r
 
     s = _make_settings_like_your_yaml(ce_artifacts_on_disk["tmp_root"])
@@ -221,7 +303,10 @@ def test_integration_dense_only(ce_artifacts_on_disk):
         assert item["bm25"]["score"] is None
 
 
-def test_integration_bm25_only(ce_artifacts_on_disk):
+def test_integration_bm25_only(ce_artifacts_on_disk, monkeypatch: pytest.MonkeyPatch):
+    # not strictly necessary, but harmless & keeps consistency
+    _patch_embedder(monkeypatch)
+
     import qr_pipeline.llm.retrieval as r
 
     s = _make_settings_like_your_yaml(ce_artifacts_on_disk["tmp_root"])
@@ -237,10 +322,12 @@ def test_integration_bm25_only(ce_artifacts_on_disk):
         assert item["dense"]["score"] is None
 
 
-def test_integration_length_mismatch_raises(tmp_path: Path, faiss_mod):
+def test_integration_length_mismatch_raises(tmp_path: Path, faiss_mod, monkeypatch: pytest.MonkeyPatch):
     """
     If chunks.jsonl length != id_map.jsonl length, retrieval.from_settings should raise ValueError.
     """
+    _patch_embedder(monkeypatch)
+
     import qr_pipeline.llm.retrieval as r
 
     base_dir = tmp_path / "ce_out"
@@ -261,8 +348,9 @@ def test_integration_length_mismatch_raises(tmp_path: Path, faiss_mod):
     # id_map: 2 (mismatch)
     _write_jsonl(vec_dir / "id_map.jsonl", [{"chunk_id": "c0"}, {"chunk_id": "c1"}])
 
-    # faiss vectors: 3 (valid file)
+    # faiss vectors: 3 (valid file, dim=4)
     xb = np.array([[1, 0, 0, 0], [0.7, 0.3, 0, 0], [0, 0, 1, 0]], dtype=np.float32)
+    xb = xb / np.linalg.norm(xb, axis=1, keepdims=True)
     index = faiss_mod.IndexFlatIP(4)
     index.add(xb)
     (vec_dir / "faiss.index").parent.mkdir(parents=True, exist_ok=True)
