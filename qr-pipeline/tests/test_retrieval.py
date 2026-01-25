@@ -49,15 +49,13 @@ def faiss_mod():
 # -----------------------------
 class FakeDualInstructEmbedder:
     """
-    A drop-in replacement for DualInstructEmbedder used by retrieval.py.
+    Drop-in replacement for qr_pipeline.processing.embedder.DualInstructEmbedder used in retrieval.py
 
-    Goal:
-      - Always output float32 embeddings with dim=4 (to match our test FAISS index)
-      - Deterministic: same input -> same vector
-      - Simple semantics:
-          query about pittsburgh -> close to c0=[1,0,0,0]
-          query about CMU/carnegie mellon -> close to c1=[0.7,0.3,0,0]
-          query about tokyo/japan -> close to c2=[0,0,1,0]
+    Your retrieval.py calls:
+      self.embedder.encode_queries([query]) -> np.ndarray shape [N, D]
+
+    So we MUST provide encode_queries().
+    We also provide several aliases (encode_passages, encode, etc.) to be robust.
     """
 
     dim = 4
@@ -85,44 +83,52 @@ class FakeDualInstructEmbedder:
     def _vec_for_text(self, text: str) -> np.ndarray:
         toks = set(self._tokenize(text))
 
-        # match test corpus intent
+        # map to same intent as our tiny test corpus:
+        # c0 ~ Pittsburgh
+        # c1 ~ CMU
+        # c2 ~ Tokyo/Japan
         if {"carnegie", "mellon", "university", "cmu"} & toks:
-            v = np.array([0.7, 0.3, 0.0, 0.0], dtype=np.float32)  # like c1
+            v = np.array([0.7, 0.3, 0.0, 0.0], dtype=np.float32)
         elif {"tokyo", "japan", "capital"} & toks:
-            v = np.array([0.0, 0.0, 1.0, 0.0], dtype=np.float32)  # like c2
+            v = np.array([0.0, 0.0, 1.0, 0.0], dtype=np.float32)
         else:
-            v = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)  # like c0
+            v = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
 
         if self.normalize_embeddings:
             n = float(np.linalg.norm(v))
             if n > 0:
                 v = v / n
-        return v
+        return v.astype(np.float32)
+
+    # ---- primary APIs ----
+    def embed_queries(self, texts: Sequence[str]) -> np.ndarray:
+        return np.stack([self._vec_for_text(t) for t in texts], axis=0).astype(np.float32)
+
+    def embed_passages(self, texts: Sequence[str]) -> np.ndarray:
+        return np.stack([self._vec_for_text(t) for t in texts], axis=0).astype(np.float32)
 
     def embed_query(self, text: str) -> np.ndarray:
-        # return shape [D]
         return self._vec_for_text(text)
-
-    def embed_queries(self, texts: Sequence[str]) -> np.ndarray:
-        # return shape [N, D]
-        out = np.stack([self._vec_for_text(t) for t in texts], axis=0).astype(np.float32)
-        return out
 
     def embed_passage(self, text: str) -> np.ndarray:
         return self._vec_for_text(text)
 
-    def embed_passages(self, texts: Sequence[str]) -> np.ndarray:
-        out = np.stack([self._vec_for_text(t) for t in texts], axis=0).astype(np.float32)
-        return out
+    # ---- aliases expected by YOUR retrieval.py ----
+    def encode_queries(self, texts: Sequence[str]) -> np.ndarray:
+        return self.embed_queries(texts)
 
-    # common alias in sentence-transformers style
-    def encode(
-        self,
-        sentences: Union[str, Sequence[str]],
-        **__: Any,
-    ) -> np.ndarray:
+    def encode_passages(self, texts: Sequence[str]) -> np.ndarray:
+        return self.embed_passages(texts)
+
+    def encode_query(self, text: str) -> np.ndarray:
+        return self.embed_query(text)
+
+    def encode_passage(self, text: str) -> np.ndarray:
+        return self.embed_passage(text)
+
+    # sentence-transformers style fallback
+    def encode(self, sentences: Union[str, Sequence[str]], **__: Any) -> np.ndarray:
         if isinstance(sentences, str):
-            # sentence-transformers returns 1D for single str
             return self._vec_for_text(sentences)
         return self.embed_queries(list(sentences))
 
@@ -143,7 +149,7 @@ def ce_artifacts_on_disk(tmp_path: Path, faiss_mod):
     Create CE artifacts on disk under:
       <tmp_path>/ce_out/...
 
-    Uses a SMALL deterministic FAISS index with dim=4.
+    Uses a deterministic FAISS index with dim=4.
     Our FakeDualInstructEmbedder outputs dim=4 too.
     """
     base_dir = tmp_path / "ce_out"
@@ -182,8 +188,9 @@ def ce_artifacts_on_disk(tmp_path: Path, faiss_mod):
         ],
         dtype=np.float32,
     )
-    # normalize to match FakeDualInstructEmbedder(normalize_embeddings=True)
+    # normalize to match normalize_embeddings=True
     xb = xb / np.linalg.norm(xb, axis=1, keepdims=True)
+
     index = faiss_mod.IndexFlatIP(4)
     index.add(xb)
     faiss_path.parent.mkdir(parents=True, exist_ok=True)
@@ -208,14 +215,14 @@ def _make_settings_like_your_yaml(tmp_root: Path) -> Dict[str, Any]:
     Build settings dict that matches your YAML-like structure.
 
     NOTE:
-      The "embedding.model_name" here is irrelevant in route B because we monkeypatch
+      In route B the model_name is irrelevant because we monkeypatch
       DualInstructEmbedder -> FakeDualInstructEmbedder (no downloads, dim=4).
     """
     return {
         "stores": {
             "fs_local": {
                 "kind": "filesystem",
-                "root": str(tmp_root),  # ✅ use tmp dir in tests
+                "root": str(tmp_root),
             }
         },
         "inputs": {
@@ -239,7 +246,7 @@ def _make_settings_like_your_yaml(tmp_root: Path) -> Dict[str, Any]:
             }
         },
         "embedding": {
-            "model_name": "intfloat/e5-base-v2",  # doesn't matter in route B
+            "model_name": "intfloat/e5-base-v2",  # route B: irrelevant
             "instructions": {"passage": "passage:", "query": "query:"},
             "batch_size": 4,
             "normalize_embeddings": True,
@@ -251,7 +258,7 @@ def _make_settings_like_your_yaml(tmp_root: Path) -> Dict[str, Any]:
             "dense": {"top_k": 2},
             "bm25": {"top_k": 2},
             "hybrid_fusion": {
-                "method": "rrf",  # rrf | linear
+                "method": "rrf",
                 "rrf_k": 60,
                 "w_dense": 0.5,
                 "w_bm25": 0.5,
@@ -260,7 +267,9 @@ def _make_settings_like_your_yaml(tmp_root: Path) -> Dict[str, Any]:
     }
 
 
-def test_integration_from_settings_and_retrieve_hybrid_rrf(ce_artifacts_on_disk, monkeypatch: pytest.MonkeyPatch):
+def test_integration_from_settings_and_retrieve_hybrid_rrf(
+    ce_artifacts_on_disk, monkeypatch: pytest.MonkeyPatch
+):
     _patch_embedder(monkeypatch)
 
     import qr_pipeline.llm.retrieval as r
@@ -273,7 +282,6 @@ def test_integration_from_settings_and_retrieve_hybrid_rrf(ce_artifacts_on_disk,
     assert len(out) == 2
 
     for item in out:
-        # ✅ schema as your retrieval.py docstring
         assert set(item.keys()) == {"key", "chunk_text", "rrf_score", "dense", "bm25"}
         assert isinstance(item["key"], str)
         assert isinstance(item["chunk_text"], str)
@@ -281,7 +289,6 @@ def test_integration_from_settings_and_retrieve_hybrid_rrf(ce_artifacts_on_disk,
         assert "rank" in item["dense"] and "score" in item["dense"]
         assert "rank" in item["bm25"] and "score" in item["bm25"]
 
-    # rrf_score should be descending
     assert out[0]["rrf_score"] >= out[1]["rrf_score"]
 
 
@@ -298,13 +305,11 @@ def test_integration_dense_only(ce_artifacts_on_disk, monkeypatch: pytest.Monkey
     assert len(out) == 2
 
     for item in out:
-        # in dense-only, bm25 wasn't executed -> should remain None
         assert item["bm25"]["rank"] is None
         assert item["bm25"]["score"] is None
 
 
 def test_integration_bm25_only(ce_artifacts_on_disk, monkeypatch: pytest.MonkeyPatch):
-    # not strictly necessary, but harmless & keeps consistency
     _patch_embedder(monkeypatch)
 
     import qr_pipeline.llm.retrieval as r
@@ -317,7 +322,6 @@ def test_integration_bm25_only(ce_artifacts_on_disk, monkeypatch: pytest.MonkeyP
     assert len(out) == 2
 
     for item in out:
-        # in bm25-only, dense wasn't executed -> should remain None
         assert item["dense"]["rank"] is None
         assert item["dense"]["score"] is None
 
