@@ -1,8 +1,7 @@
 # src/qr_pipeline/query_generation.py
-#  通过store 提取 chunks_Jsonl, 使用llm 生成 query , 将每个query 的text 进行 normalization,  然后使用hash 生成 query ID,  根据ID 进行exact dedup
-#  之后对 in_domain完整的query_jsonl 进行储存.    
-# queries_in_domain: queries/in_domain.jsonl (去重后) 
-# queries_out_domain: queries/out_domain.jsonl  (去重后)
+# chunks.jsonl -> LLM generate queries -> normalize -> hash (qid) -> exact dedup
+# -> BUFFER -> batch domain classify (15 per call) -> write in/out domain jsonl
+# Early stop ONLY based on IN-domain unique queries count.
 
 from __future__ import annotations
 
@@ -99,7 +98,6 @@ class HFTransformersLLM:
         import torch  # type: ignore
 
         inputs = self._tok(prompt, return_tensors="pt")
-        
         inputs = {k: v.to(self._model.device) for k, v in inputs.items()}
 
         do_sample = (self.temperature is not None) and (self.temperature > 0.0)
@@ -171,19 +169,39 @@ def _build_query_prompt(chunk_text: str, p: Dict[str, Any]) -> str:
     return _build_query_prompt(chunk_text, {**p, "language": "en"})
 
 
-def _build_domain_prompt(query_norm: str) -> str:
-    # 强约束：只输出 IN 或 OUT，便于解析
+DEFAULT_DOMAIN_DESC = "question about Pittsburgh and CMU, including history, culture, trivia, and upcoming events"
+
+
+def _build_domain_batch_prompt(items: List[Dict[str, Any]], domain_desc: str) -> str:
+    """
+    Batch classify, output IDs only for robustness.
+    Input items: [{"qid":..., "query_text_norm":...}, ...]
+    Output format:
+      IN:
+      Q1
+      Q3
+      OUT:
+      Q2
+    """
     lines: List[str] = []
     lines.append("You are a strict text classifier.")
-    lines.append(
-        'Determine whether the query belongs to the domain: "question about Pittsburgh and CMU, including history, culture, trivia, and upcoming events".'
-    )
-    lines.append("Output exactly one token: IN or OUT.")
+    lines.append(f'Domain: "{domain_desc}".')
+    lines.append("Task: classify each query as IN (within Domain) or OUT (outside Domain).")
     lines.append("")
-    lines.append("Query:")
-    lines.append(query_norm)
+    lines.append("CRITICAL rules:")
+    lines.append("- Do NOT rewrite queries.")
+    lines.append("- Output ONLY IDs (Q1, Q2, ...) under IN/OUT.")
+    lines.append("- Every provided ID must appear exactly once in either IN or OUT.")
+    lines.append("- Output MUST have exactly two sections in this order: IN: then OUT:.")
+    lines.append("")
+    lines.append("Queries:")
+    for i, it in enumerate(items, start=1):
+        q = str(it.get("query_text_norm", ""))
+        lines.append(f"Q{i}: {q}")
     lines.append("")
     lines.append("Answer:")
+    lines.append("IN:")
+    lines.append("OUT:")
     return "\n".join(lines)
 
 
@@ -201,17 +219,58 @@ def _parse_queries(raw: str) -> List[str]:
     return out
 
 
-def _parse_domain_label(raw: str) -> Optional[str]:
-    t = raw.strip().upper()
-    if t == "IN":
-        return "IN"
-    if t == "OUT":
-        return "OUT"
-    if re.search(r"\bIN\b", t):
-        return "IN"
-    if re.search(r"\bOUT\b", t):
-        return "OUT"
-    return None
+def _parse_in_out_ids(raw: str) -> Tuple[List[int], List[int]]:
+    """
+    Parse batch classifier output. Accepts:
+      IN:
+      Q1
+      Q3
+      OUT:
+      Q2
+    Returns 0-based indices.
+    """
+    text = raw.strip()
+    if not text:
+        return [], []
+
+    in_ids: List[int] = []
+    out_ids: List[int] = []
+    mode: Optional[str] = None
+
+    for line in text.splitlines():
+        t = line.strip()
+        if not t:
+            continue
+        if re.fullmatch(r"IN\s*:\s*", t, flags=re.IGNORECASE):
+            mode = "IN"
+            continue
+        if re.fullmatch(r"OUT\s*:\s*", t, flags=re.IGNORECASE):
+            mode = "OUT"
+            continue
+
+        m = re.search(r"\bQ(\d+)\b", t, flags=re.IGNORECASE)
+        if not m:
+            continue
+        idx = int(m.group(1)) - 1
+        if idx < 0:
+            continue
+        if mode == "IN":
+            in_ids.append(idx)
+        elif mode == "OUT":
+            out_ids.append(idx)
+
+    return in_ids, out_ids
+
+
+def _unique_preserve_order(xs: List[int]) -> List[int]:
+    seen: set[int] = set()
+    out: List[int] = []
+    for x in xs:
+        if x in seen:
+            continue
+        seen.add(x)
+        out.append(x)
+    return out
 
 
 # -----------------------------
@@ -238,7 +297,8 @@ def _sample_chunks(rows: List[Dict[str, Any]], sampling_cfg: Dict[str, Any]) -> 
 def run_query_generation(s: Dict[str, Any]) -> Dict[str, Any]:
     """
     chunks.jsonl -> generate queries -> normalize -> hash
-    -> LLM domain classify -> write in/out domain jsonl (paths from config)
+    -> BUFFER -> batch LLM domain classify (15 per call)
+    -> write in/out domain jsonl (paths from config)
     Early stop ONLY based on IN-domain unique queries count.
     """
     stores = build_store_registry(s)
@@ -254,7 +314,6 @@ def run_query_generation(s: Dict[str, Any]) -> Dict[str, Any]:
     out_base = str(out_cfg["base"])
     files = out_cfg["files"]
 
-    # 必须存在这些 key（你 config 要加上）
     errors_path = _posix_join(out_base, str(files["errors"]))
     in_domain_path = _posix_join(out_base, str(files["queries_in_domain"]))
     out_domain_path = _posix_join(out_base, str(files["queries_out_domain"]))
@@ -267,6 +326,11 @@ def run_query_generation(s: Dict[str, Any]) -> Dict[str, Any]:
     prompt_cfg = qg.get("prompt", {}) or {}
     post_cfg = qg.get("postprocess", {}) or {}
     norm_cfg = qg.get("normalize", {}) or {}
+
+    # domain classify batch config (default 15)
+    dom_cfg = qg.get("domain_classify", {}) or {}
+    batch_size = _safe_int(dom_cfg.get("batch_size", 15), 15)
+    domain_desc = str(dom_cfg.get("domain_desc", DEFAULT_DOMAIN_DESC))
 
     min_chars = _safe_int(post_cfg.get("min_query_chars", 8), 8)
     max_chars = _safe_int(post_cfg.get("max_query_chars", 160), 160)
@@ -281,7 +345,7 @@ def run_query_generation(s: Dict[str, Any]) -> Dict[str, Any]:
     # ---- LLM ----
     llm, llm_model_name = _build_llm_from_settings(s)
 
-    # ---- read chunks (best-effort) ----
+    # ---- read chunks ----
     read_errors = 0
 
     def _on_read_error(payload: Dict[str, Any]) -> None:
@@ -300,14 +364,122 @@ def run_query_generation(s: Dict[str, Any]) -> Dict[str, Any]:
 
     # ---- counters ----
     total_llm_calls_gen = 0
-    total_llm_calls_domain = 0
+    total_llm_calls_domain_batch = 0
     total_raw_queries = 0
     total_after_post = 0
     total_in_unique = 0
     total_out_unique = 0
 
+    # ---- buffer for batch domain classify ----
+    # each item: {"qid":..., "query_text_norm":..., "chunk_id":...}
+    buffer_items: List[Dict[str, Any]] = []
+
+    def _flush_buffer() -> None:
+        nonlocal total_llm_calls_domain_batch, total_in_unique, total_out_unique
+
+        if not buffer_items:
+            return
+
+        dom_prompt = _build_domain_batch_prompt(buffer_items, domain_desc)
+        try:
+            dom_raw = llm.generate(dom_prompt)
+            total_llm_calls_domain_batch += 1
+        except Exception as e:
+            append_jsonl(
+                out_store,
+                errors_path,
+                [{
+                    "ts_ms": _now_ms(),
+                    "stage": "llm_domain_classify_batch",
+                    "batch_size": int(len(buffer_items)),
+                    "error": f"{type(e).__name__}: {e}",
+                }],
+            )
+            buffer_items.clear()
+            return
+
+        in_ids, out_ids = _parse_in_out_ids(dom_raw)
+        in_ids = _unique_preserve_order(in_ids)
+        out_ids = _unique_preserve_order(out_ids)
+
+        k = len(buffer_items)
+        all_ids = set(range(k))
+        got = set(in_ids) | set(out_ids)
+        missing = sorted(all_ids - got)
+
+        # 兜底：缺失的一律 OUT（更保守）
+        out_ids = _unique_preserve_order(out_ids + missing)
+
+        # 再兜底：如果某个 idx 同时出现在 IN 和 OUT，以 IN 为准，把它从 OUT 去掉
+        in_set = set(in_ids)
+        out_ids = [i for i in out_ids if i not in in_set]
+
+        # 应用分类结果
+        def _apply(idx: int, label: str) -> None:
+            nonlocal total_in_unique, total_out_unique
+            if idx < 0 or idx >= k:
+                return
+            it = buffer_items[idx]
+            qid = str(it["qid"])
+            q_norm = str(it["query_text_norm"])
+            chunk_id = it.get("chunk_id")
+
+            if label == "IN":
+                if qid not in in_map:
+                    in_map[qid] = {
+                        "query_id": qid,
+                        "query_text_norm": q_norm,
+                        "source_chunk_ids": [chunk_id] if chunk_id else [],
+                        "llm_model": llm_model_name,
+                        "prompt_style": prompt_style,
+                        "domain": "in",
+                    }
+                    total_in_unique += 1
+                else:
+                    if chunk_id:
+                        srcs = in_map[qid]["source_chunk_ids"]
+                        if chunk_id not in srcs:
+                            srcs.append(chunk_id)
+            else:
+                if qid not in out_map:
+                    out_map[qid] = {
+                        "query_id": qid,
+                        "query_text_norm": q_norm,
+                        "source_chunk_ids": [chunk_id] if chunk_id else [],
+                        "llm_model": llm_model_name,
+                        "prompt_style": prompt_style,
+                        "domain": "out",
+                    }
+                    total_out_unique += 1
+                else:
+                    if chunk_id:
+                        srcs = out_map[qid]["source_chunk_ids"]
+                        if chunk_id not in srcs:
+                            srcs.append(chunk_id)
+
+        for i in in_ids:
+            _apply(i, "IN")
+        for i in out_ids:
+            _apply(i, "OUT")
+
+        # 记录一下“模型漏分”的情况，方便你观察是否随 batch 变大而变差
+        if missing:
+            append_jsonl(
+                out_store,
+                errors_path,
+                [{
+                    "ts_ms": _now_ms(),
+                    "stage": "parse_domain_batch_label",
+                    "batch_size": int(k),
+                    "missing_ids": [f"Q{i+1}" for i in missing][:50],
+                    "llm_output_preview": dom_raw[:400],
+                    "error": "Batch classifier output missing some IDs; defaulted them to OUT.",
+                }],
+            )
+
+        buffer_items.clear()
+
     for row in sampled:
-        # ✅ 早停只看 IN-domain
         if total_in_unique >= target_in_domain:
             break
 
@@ -370,79 +542,36 @@ def run_query_generation(s: Dict[str, Any]) -> Dict[str, Any]:
                 continue
 
             qid = _make_id(q_norm)
+
             if avoid_near_duplicates and (qid in seen_in_chunk):
                 continue
             seen_in_chunk.add(qid)
 
+            # 全局 exact dedup：如果已经被分类进 in/out，就没必要再进 buffer
+            if (qid in in_map) or (qid in out_map):
+                continue
+
             total_after_post += 1
 
-            # ---- domain classify ----
-            dom_prompt = _build_domain_prompt(q_norm)
-            try:
-                dom_raw = llm.generate(dom_prompt)
-                total_llm_calls_domain += 1
-            except Exception as e:
-                append_jsonl(
-                    out_store,
-                    errors_path,
-                    [{
-                        "ts_ms": _now_ms(),
-                        "stage": "llm_domain_classify",
-                        "chunk_id": chunk_id,
-                        "query_id": qid,
-                        "query_text_norm": q_norm,
-                        "error": f"{type(e).__name__}: {e}",
-                    }],
-                )
-                continue
+            buffer_items.append(
+                {
+                    "qid": qid,
+                    "query_text_norm": q_norm,
+                    "chunk_id": chunk_id,
+                }
+            )
 
-            label = _parse_domain_label(dom_raw)
-            if label is None:
-                append_jsonl(
-                    out_store,
-                    errors_path,
-                    [{
-                        "ts_ms": _now_ms(),
-                        "stage": "parse_domain_label",
-                        "chunk_id": chunk_id,
-                        "query_id": qid,
-                        "query_text_norm": q_norm,
-                        "llm_output_preview": dom_raw[:200],
-                        "error": "Could not parse domain label (expected IN/OUT).",
-                    }],
-                )
-                continue
+            # 满 15 就 flush 一次
+            if len(buffer_items) >= batch_size:
+                _flush_buffer()
 
-            if label == "IN":
-                if qid not in in_map:
-                    in_map[qid] = {
-                        "query_id": qid,
-                        "query_text_norm": q_norm,
-                        "source_chunk_ids": [chunk_id],
-                        "llm_model": llm_model_name,
-                        "prompt_style": prompt_style,
-                        "domain": "in",
-                    }
-                    total_in_unique += 1
-                else:
-                    srcs = in_map[qid]["source_chunk_ids"]
-                    if chunk_id not in srcs:
-                        srcs.append(chunk_id)
-            else:
-                if qid not in out_map:
-                    out_map[qid] = {
-                        "query_id": qid,
-                        "query_text_norm": q_norm,
-                        "source_chunk_ids": [chunk_id],
-                        "llm_model": llm_model_name,
-                        "prompt_style": prompt_style,
-                        "domain": "out",
-                    }
-                    total_out_unique += 1
-                else:
-                    srcs = out_map[qid]["source_chunk_ids"]
-                    if chunk_id not in srcs:
-                        srcs.append(chunk_id)
+                # flush 后可能已经达标
+                if total_in_unique >= target_in_domain:
+                    break
+
+    # 最后把不足 15 的尾巴也 flush 掉
+    if total_in_unique < target_in_domain:
+        _flush_buffer()
 
     # ---- write outputs deterministically ----
     def _iter_sorted(m: Dict[str, Dict[str, Any]]) -> Iterator[Dict[str, Any]]:
@@ -452,16 +581,13 @@ def run_query_generation(s: Dict[str, Any]) -> Dict[str, Any]:
     write_jsonl(out_store, in_domain_path, _iter_sorted(in_map))
     write_jsonl(out_store, out_domain_path, _iter_sorted(out_map))
 
-    # ---- stats (建议字段与 config 对齐) ----
     stats = {
         "ts_ms": _now_ms(),
-
         "inputs": {
             "chunks_path": chunks_path,
             "num_chunks_total_read": int(len(rows)),
             "num_chunks_sampled": int(len(sampled)),
         },
-
         "outputs": {
             "queries_in_domain_path": in_domain_path,
             "queries_out_domain_path": out_domain_path,
@@ -469,19 +595,19 @@ def run_query_generation(s: Dict[str, Any]) -> Dict[str, Any]:
             "num_queries_in_domain_unique_written": int(total_in_unique),
             "num_queries_out_domain_unique_written": int(total_out_unique),
         },
-
         "counters": {
             "read_errors": int(read_errors),
             "llm_calls_generate_queries": int(total_llm_calls_gen),
-            "llm_calls_domain_classify": int(total_llm_calls_domain),
+            "llm_calls_domain_classify_batch": int(total_llm_calls_domain_batch),
             "raw_queries_parsed": int(total_raw_queries),
             "kept_after_postprocess": int(total_after_post),
+            "domain_batch_size": int(batch_size),
         },
-
         "meta": {
             "llm_model": llm_model_name,
             "prompt_style": prompt_style,
             "target_num_in_domain": int(target_in_domain),
+            "domain_desc": domain_desc,
             "normalize": {
                 "lower": bool(lower),
                 "strip": bool(strip),
@@ -499,7 +625,6 @@ def main(config_path: str) -> None:
     s = load_settings(config_path)
     stats = run_query_generation(s)
 
-    # run_stats.json 路径来自 config
     out_cfg = s["outputs"]
     stores = build_store_registry(s)
     out_store = stores[str(out_cfg["store"])]
