@@ -7,7 +7,7 @@
 stores:
   fs_local:
     kind: filesystem
-    root: data
+    root: /content/drive/MyDrive/rag-kb-data/testdata
 
 # ---------- Inputs: ce-pipeline artifacts ----------
 inputs:
@@ -31,7 +31,7 @@ inputs:
 # ---------- Outputs ----------
 outputs:
   store: fs_local
-  base: rq_out
+  base: rq_out_test
 
   files:
     queries_in_domain: queries/in_domain.jsonl
@@ -48,7 +48,7 @@ models:
     provider: hf_transformers # or vllm / hf_inference / openai (if you support)
     model_name: Qwen2.5-7B-Instruct
     device: cuda # cpu/cuda
-    cache_dir: data/.hf_cache
+    cache_dir: /content/drive/MyDrive/rag-kb-data/testdatadata/.hf_cache
     max_new_tokens: 128
     temperature: 0.7
     top_p: 0.9
@@ -58,7 +58,7 @@ models:
     model_name: "intfloat/e5-base-v2"
     device: cuda # "cpu" / "cuda" / None(auto)
     batch_size: 64
-    cache_dir: data/.hf_cache
+    cache_dir: /content/drive/MyDrive/rag-kb-data/data/.hf_cache
     normalize_embeddings: true
     instructions:
       passage: "passage: "

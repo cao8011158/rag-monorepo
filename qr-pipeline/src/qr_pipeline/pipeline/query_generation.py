@@ -99,8 +99,8 @@ class HFTransformersLLM:
         import torch  # type: ignore
 
         inputs = self._tok(prompt, return_tensors="pt")
-        if str(self.device).lower() != "cuda":
-            inputs = {k: v.to(self._model.device) for k, v in inputs.items()}
+        
+        inputs = {k: v.to(self._model.device) for k, v in inputs.items()}
 
         do_sample = (self.temperature is not None) and (self.temperature > 0.0)
 
