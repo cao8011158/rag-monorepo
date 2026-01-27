@@ -180,15 +180,20 @@ def _build_domain_batch_prompt_qstyle(items: List[Tuple[str, str]]) -> Tuple[str
     """
     qlabel_to_real_id: Dict[str, str] = {}
     lines: List[str] = []
-
     lines.append("You are a strict classifier.")
     lines.append("")
     lines.append("Domain:")
-    lines.append("Questions mainly about Pittsburgh or Carnegie Mellon University (CMU), including history, culture, campus life, trivia, and events.")
+    lines.append(
+        "Questions primarily about Pittsburgh or Carnegie Mellon University (CMU). "
+        "This includes history and historical events, geography and location, population and demographics, "
+        "economy and industry, culture, campus life, traditions, trivia, and events. "
+        "Comparisons with other cities or regions are IN-DOMAIN when Pittsburgh or CMU is the main subject."
+    )
     lines.append("")
-    lines.append("Rule:")
-    lines.append("- Choose IN only if Pittsburgh or CMU is the MAIN topic.")
-    lines.append("- If uncertain, choose OUT.")
+    lines.append("Decision rules:")
+    lines.append("- Choose IN if the main topic is Pittsburgh or CMU, even if the question involves comparison, analysis, or history.")
+    lines.append("- Choose OUT if the question is mainly about other cities, other universities, or general national/global topics.")
+    lines.append("- If Pittsburgh or CMU is only a minor example, choose OUT.")
     lines.append("")
     lines.append("Output format (strict):")
     lines.append("IN:")
@@ -201,16 +206,19 @@ def _build_domain_batch_prompt_qstyle(items: List[Tuple[str, str]]) -> Tuple[str
     lines.append("Q1\twhat year was carnegie mellon university founded")
     lines.append("Q2\tbest universities for computer science in the us")
     lines.append("Q3\tmajor sports teams in pittsburgh")
+    lines.append("Q4\thow did the whiskey rebellion impact pittsburgh's development")
     lines.append("")
     lines.append("Output:")
     lines.append("IN:")
     lines.append("Q1")
     lines.append("Q3")
+    lines.append("Q4")
     lines.append("OUT:")
     lines.append("Q2")
     lines.append("")
     lines.append("Now classify the following queries:")
     lines.append("Input:")
+
 
     for i, (real_id, qnorm) in enumerate(items, start=1):
         qlabel = f"Q{i}"
