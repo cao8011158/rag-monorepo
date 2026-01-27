@@ -6,6 +6,7 @@ from typing import Any, Dict, Optional, Set
 
 import hashlib
 import json
+
 import yaml
 
 SettingsDict = Dict[str, Any]
@@ -45,10 +46,6 @@ def load_settings(path: str | Path) -> SettingsDict:
 def apply_defaults(raw: SettingsDict) -> SettingsDict:
     """
     Apply defaults to raw YAML, ensuring required nested objects exist.
-
-    NOTE:
-    - This version aligns with your YAML config (pair_construction.* new structure, outputs filenames, etc.)
-    - It also keeps backward compatibility with older configs.
     """
     s: SettingsDict = _deep_copy_dict(raw)
 
@@ -93,11 +90,10 @@ def apply_defaults(raw: SettingsDict) -> SettingsDict:
     _must_be_mapping(s["outputs"]["files"], "outputs.files")
 
     of = s["outputs"]["files"]
-    # align with your YAML snippet
     of.setdefault("queries_in_domain", "queries/in_domain.jsonl")
     of.setdefault("queries_out_domain", "queries/out_domain.jsonl")
-    of.setdefault("candidates", "pairs.pairwise.jsonl")
-    of.setdefault("pairs", "pairs.pairwise_train.jsonl")
+    of.setdefault("candidates", "retrieval_candidates.jsonl")
+    of.setdefault("pairs", "pairs.pairwise.train.jsonl")
     of.setdefault("stats", "run_stats.json")
     of.setdefault("errors", "errors.jsonl")
 
@@ -143,15 +139,15 @@ def apply_defaults(raw: SettingsDict) -> SettingsDict:
     qg["sampling"].setdefault("seed", 42)
     qg["sampling"].setdefault("strategy", "uniform_random")
     qg["sampling"].setdefault("max_chunks_considered", 6500)
-    qg["sampling"].setdefault("per_doc_cap", None)
+    qg["sampling"].setdefault("per_doc_cap", None)  # only for specific strategies
 
     qg.setdefault("prompt", {})
     _must_be_mapping(qg["prompt"], "query_generation.prompt")
     p = qg["prompt"]
     p.setdefault("language", "en")
     p.setdefault("style", "information-seeking")
-    p.setdefault("num_queries_per_chunk", 3)
-    p.setdefault("max_chunk_chars", 2100)
+    p.setdefault("num_queries_per_chunk", 1)
+    p.setdefault("max_chunk_chars", 1800)
     p.setdefault("diversify", True)
     p.setdefault("diversity_hints", "")
     p.setdefault("avoid_near_duplicates", True)
@@ -184,6 +180,7 @@ def apply_defaults(raw: SettingsDict) -> SettingsDict:
     sd.setdefault("ef_construction", 200)
     sd.setdefault("ef_search", 128)
     sd.setdefault("normalize", True)
+
     sd.setdefault("min_text_chars", 20)
     sd.setdefault("keep_strategy", "longest")  # longest | first
     sd.setdefault("max_remove_ratio", 0.5)
@@ -193,16 +190,16 @@ def apply_defaults(raw: SettingsDict) -> SettingsDict:
     _must_be_mapping(s["retrieval"], "retrieval")
     r = s["retrieval"]
     r.setdefault("mode", "hybrid")  # dense | bm25 | hybrid
-    r.setdefault("top_k", 15)
+    r.setdefault("top_k", 30)
 
     r.setdefault("dense", {})
     _must_be_mapping(r["dense"], "retrieval.dense")
-    r["dense"].setdefault("top_k", 15)
+    r["dense"].setdefault("top_k", 30)
     r["dense"].setdefault("normalize_query", True)
 
     r.setdefault("bm25", {})
     _must_be_mapping(r["bm25"], "retrieval.bm25")
-    r["bm25"].setdefault("top_k", 30)
+    r["bm25"].setdefault("top_k", 60)
 
     r.setdefault("hybrid_fusion", {})
     _must_be_mapping(r["hybrid_fusion"], "retrieval.hybrid_fusion")
@@ -217,34 +214,20 @@ def apply_defaults(raw: SettingsDict) -> SettingsDict:
     _must_be_mapping(s["pair_construction"], "pair_construction")
     pc = s["pair_construction"]
 
-    # positive
     pc.setdefault("positive", {})
     _must_be_mapping(pc["positive"], "pair_construction.positive")
-    pos = pc["positive"]
-    pos.setdefault("strategy", "source_chunk")  # allow new strategies in validate
-    pos.setdefault("min_cosine", 0.85)  # only for threshold_match
+    pc["positive"].setdefault("strategy", "source_chunk")
+    pc["positive"].setdefault("min_cosine", 0.85)  # only when threshold_match
 
-    # New: nested llm config under positive.llm
-    pos.setdefault("llm", {})
-    _must_be_mapping(pos["llm"], "pair_construction.positive.llm")
-    pos_llm = pos["llm"]
-    pos_llm.setdefault("enable", False)
-    pos_llm.setdefault("max_extra_positives", 2)
-    pos_llm.setdefault("require_evidence", True)
-
-    # hard_negatives
     pc.setdefault("hard_negatives", {})
     _must_be_mapping(pc["hard_negatives"], "pair_construction.hard_negatives")
     hn = pc["hard_negatives"]
     hn.setdefault("num_per_query", 6)
-    hn.setdefault("strategy", "top_rank_excluding_pos")  # allow llm_judged in validate
+    hn.setdefault("strategy", "top_rank_excluding_pos")
 
     hn.setdefault("filters", {})
     _must_be_mapping(hn["filters"], "pair_construction.hard_negatives.filters")
     flt = hn["filters"]
-
-    # Back-compat: old configs used enable_similarity_filter
-    # New configs can omit it. We default it to True but don't require it.
     flt.setdefault("enable_similarity_filter", True)
     flt.setdefault("max_cosine_with_positive", 0.92)
     flt.setdefault("enable_text_hash_dedup", True)
@@ -334,9 +317,7 @@ def validate_settings(s: SettingsDict) -> None:
 
     if str(sp.get("strategy")) in {"stratified_by_doc", "per_doc_cap"}:
         if sp.get("per_doc_cap") is None:
-            raise ValueError(
-                "query_generation.sampling.per_doc_cap is required when strategy is stratified_by_doc/per_doc_cap"
-            )
+            raise ValueError("query_generation.sampling.per_doc_cap is required when strategy is stratified_by_doc/per_doc_cap")
         _as_int(sp.get("per_doc_cap"), "query_generation.sampling.per_doc_cap", min_value=1)
 
     pr = qg["prompt"]
@@ -362,6 +343,7 @@ def validate_settings(s: SettingsDict) -> None:
         _as_int(sd.get("min_text_chars"), "processing.dedup.semantic_dedup.min_text_chars", min_value=0)
         _validate_enum(str(sd.get("keep_strategy")), {"longest", "first"}, "processing.dedup.semantic_dedup.keep_strategy")
         _as_float(sd.get("max_remove_ratio"), "processing.dedup.semantic_dedup.max_remove_ratio", min_value=0.0, max_value=1.0)
+        # threshold already validated in thr; keep thr variable to silence linters
         _ = thr
 
     # ---- retrieval ----
@@ -387,62 +369,28 @@ def validate_settings(s: SettingsDict) -> None:
     pc = s["pair_construction"]
 
     pos = pc["positive"]
-    _validate_enum(
-        str(pos.get("strategy")),
-        {
-            "source_chunk",
-            "best_ranked",
-            "threshold_match",
-            # NEW (your YAML)
-            "source_chunk_plus_llm_verified",
-        },
-        "pair_construction.positive.strategy",
-    )
+    _validate_enum(str(pos.get("strategy")), {"source_chunk", "best_ranked", "threshold_match"}, "pair_construction.positive.strategy")
     if str(pos.get("strategy")) == "threshold_match":
         _as_float(pos.get("min_cosine"), "pair_construction.positive.min_cosine", min_value=0.0, max_value=1.0)
-
-    # NEW: positive.llm nested
-    if not isinstance(pos.get("llm"), dict):
-        raise ValueError("pair_construction.positive.llm must be a mapping (YAML dict)")
-    pos_llm = pos["llm"]
-    if not isinstance(pos_llm.get("enable"), bool):
-        raise ValueError("pair_construction.positive.llm.enable must be boolean")
-    _as_int(pos_llm.get("max_extra_positives"), "pair_construction.positive.llm.max_extra_positives", min_value=0)
-    if not isinstance(pos_llm.get("require_evidence"), bool):
-        raise ValueError("pair_construction.positive.llm.require_evidence must be boolean")
 
     hn = pc["hard_negatives"]
     _as_int(hn.get("num_per_query"), "pair_construction.hard_negatives.num_per_query", min_value=1)
     _validate_enum(
         str(hn.get("strategy")),
-        {
-            "top_rank_excluding_pos",
-            "score_band",
-            "mixed",
-            # NEW (your YAML)
-            "llm_judged",
-        },
+        {"top_rank_excluding_pos", "score_band", "mixed"},
         "pair_construction.hard_negatives.strategy",
     )
 
     flt = hn["filters"]
-    if not isinstance(flt, dict):
-        raise ValueError("pair_construction.hard_negatives.filters must be a mapping (YAML dict)")
-
-    # Back-compat: enable_similarity_filter might be missing in new configs
-    if "enable_similarity_filter" in flt and not isinstance(flt.get("enable_similarity_filter"), bool):
+    if not isinstance(flt.get("enable_similarity_filter"), bool):
         raise ValueError("pair_construction.hard_negatives.filters.enable_similarity_filter must be boolean")
-
-    # If enable_similarity_filter is absent => treat as enabled when max_cosine_with_positive is provided
-    enable_sim = bool(flt.get("enable_similarity_filter", True))
-    if enable_sim:
+    if flt.get("enable_similarity_filter"):
         _as_float(
             flt.get("max_cosine_with_positive"),
             "pair_construction.hard_negatives.filters.max_cosine_with_positive",
             min_value=0.0,
             max_value=1.0,
         )
-
     if not isinstance(flt.get("enable_text_hash_dedup"), bool):
         raise ValueError("pair_construction.hard_negatives.filters.enable_text_hash_dedup must be boolean")
 
@@ -450,6 +398,7 @@ def validate_settings(s: SettingsDict) -> None:
     referenced: Set[str] = set()
     referenced.add(str(out.get("store", "") or ""))
 
+    # inputs stores
     referenced.add(str(ch.get("store", "") or ""))
     referenced.add(str(vi.get("store", "") or ""))
     referenced.add(str(bi.get("store", "") or ""))

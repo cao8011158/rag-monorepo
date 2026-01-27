@@ -36,8 +36,8 @@ outputs:
   files:
     queries_in_domain: queries/in_domain.jsonl
     queries_out_domain: queries/out_domain.jsonl
-    candidates: retrieval_candidates.jsonl
-    pairs: pairs.pairwise.train.jsonl
+    candidates: pairs.pairwise.jsonl
+    pairs: pairs.pairwise_train.jsonl
     stats: run_stats.json
     errors: errors.jsonl
 
@@ -66,7 +66,7 @@ models:
 
 # ---------- Query generation ----------
 query_generation:
-  target_num_queries: 2000
+  target_num_queries: 4000
 
   # how to sample chunks for query generation
   sampling:
@@ -129,13 +129,13 @@ processing:
 # ---------- Retrieval ----------
 retrieval:
   mode: hybrid # dense | bm25 | hybrid
-  top_k: 30 # candidates pool per query
+  top_k: 15 # candidates pool per query
 
   dense:
-    top_k: 30
+    top_k: 15
 
   bm25:
-    top_k: 60
+    top_k: 30
 
   hybrid_fusion:
     method: rrf # rrf | linear
@@ -147,16 +147,15 @@ retrieval:
 # ---------- Pair construction ----------
 pair_construction:
   positive:
-    strategy: source_chunk # source_chunk | best_ranked | threshold_match
-    # when strategy=threshold_match:
-    # min_cosine: 0.85
+    strategy: source_chunk_plus_llm_verified
+    llm:
+      enable: true
+      max_extra_positives: 2
+      require_evidence: true
 
   hard_negatives:
     num_per_query: 6
-    strategy: top_rank_excluding_pos # top_rank_excluding_pos | score_band | mixed
-    # avoid false negatives that are too similar to positive
+    strategy: llm_judged
     filters:
-      enable_similarity_filter: true
       max_cosine_with_positive: 0.92
-      # optional: also avoid near-duplicate negatives
       enable_text_hash_dedup: true

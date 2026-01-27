@@ -1,0 +1,68 @@
+# Base reranker model (cross-encoder).
+# Example (you choose one):
+# - BAAI/bge-reranker-v2-m3
+# - mixedbread-ai/mxbai-rerank-large-v1 (example name, use what you actually download)
+model_name: "BAAI/bge-reranker-v2-m3"
+
+stores:
+  fs_local:
+    kind: filesystem
+    root: /content/drive/MyDrive/rag-kb-data
+
+# ---------- DATA ----------
+inputs:
+  store: fs_local
+  base: rq_out
+
+  files:
+    train_path: "data/processed/train.jsonl"
+    valid_path: "data/processed/valid.jsonl"
+    candidates: pairs.pairwise.jsonl
+    pairs: pairs.pairwise.train.jsonl
+    stats: run_stats.json
+    errors: errors.jsonl
+
+# Tokenization
+max_length: 512
+# combine strategy:
+# "query_doc" means we encode as (query, doc) pair for cross-encoder.
+pair_format: "query_doc"
+
+# Training
+output_dir: "outputs/run1"
+seed: 42
+num_epochs: 2
+lr: 2.0e-5
+weight_decay: 0.01
+warmup_ratio: 0.05
+per_device_train_batch_size: 8
+per_device_eval_batch_size: 16
+grad_accum_steps: 2
+log_every_steps: 20
+eval_every_steps: 200
+save_every_steps: 200
+max_steps: null # set integer to cap training
+
+# Pairwise sampling
+# Re-sample negatives each epoch:
+negs_per_query_per_epoch: 2
+# if you already have hard negatives, keep it true; if not, mix random:
+mix_random_negs: true
+random_neg_ratio: 0.25
+
+# QLoRA / LoRA
+lora:
+  enabled: true
+  qlora_4bit: true
+  r: 16
+  alpha: 32
+  dropout: 0.05
+  # typical target modules for transformer blocks:
+  target_modules: ["q_proj", "k_proj", "v_proj", "o_proj"]
+
+# Precision
+bf16: true
+fp16: false
+
+# Misc
+num_workers: 2

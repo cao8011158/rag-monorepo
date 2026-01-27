@@ -1,0 +1,11 @@
+pyyaml>=6.0.1
+orjson>=3.10.0
+tqdm>=4.66.0
+numpy>=1.26.0
+scikit-learn>=1.4.0
+torch>=2.2.0
+transformers>=4.41.0
+datasets>=2.19.0
+accelerate>=0.33.0
+peft>=0.12.0
+bitsandbytes>=0.43.0
