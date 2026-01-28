@@ -17,6 +17,9 @@ class BM25Artifact:
     bm25: BM25Okapi
     doc_ids: List[str]  # 与 corpus 顺序一致（例如 chunk_id）
 
+    def get_scores(self, tokenized_query):
+        return self.bm25.get_scores(tokenized_query)    
+
 
 def build_bm25_index(texts: List[str]) -> BM25Okapi:
     corpus = [_simple_tokenize(t) for t in texts]
@@ -32,5 +35,3 @@ def load_bm25(store: Store, path: str) -> BM25Artifact:
     data = store.read_bytes(path)
     return pickle.loads(data)
 
-def get_scores(self, tokenized_query):
-    return self.bm25.get_scores(tokenized_query)
