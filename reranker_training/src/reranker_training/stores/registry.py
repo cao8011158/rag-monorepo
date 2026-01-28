@@ -4,8 +4,8 @@ from pathlib import Path
 from typing import Any, Dict
 
 from reranker_training.stores.base import Store
-from reranker_training.filesystem import FilesystemStore
-from reranker_training.object_storage import S3Store
+from reranker_training.stores.filesystem import FilesystemStore
+from reranker_training.stores.object_storage import S3Store
 
 
 def build_store_registry(cfg: Dict[str, Any]) -> Dict[str, Store]:

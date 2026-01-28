@@ -42,6 +42,8 @@ retrieval-gpu = [
 
 [project.scripts]
 qr-qg = "qr_pipeline.pipeline.run_qg:main"
+qr-pair = "qr_pipeline.pipeline.run_pairing:main"
+
 
 [tool.setuptools]
 package-dir = { "" = "src" }

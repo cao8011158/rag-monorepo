@@ -345,12 +345,17 @@ def _sample_chunks(rows: List[Dict[str, Any]], sampling_cfg: Dict[str, Any]) -> 
 def run_query_generation(s: Dict[str, Any]) -> Dict[str, Any]:
     """
     chunks.jsonl -> generate queries -> normalize -> hash
-    -> LLM domain classify (BATCH, Q1..Qn labels) -> write in/out domain jsonl (paths from config)
-    Early stop ONLY based on IN-domain unique queries count.
+    -> domain classify (batch)
+    -> append in/out domain jsonl
+    -> stats checkpoint each batch
+    Dedup via seen_ids only (方案A：重复忽略 source_chunk_ids)
     """
+
+    import json
+
     stores = build_store_registry(s)
 
-    # ---- inputs: chunks ----
+    # ---- inputs ----
     in_cfg = s["inputs"]["ce_artifacts"]["chunks"]
     in_store = stores[str(in_cfg["store"])]
     chunks_path = _posix_join(str(in_cfg["base"]), str(in_cfg["chunks_file"]))
@@ -364,6 +369,7 @@ def run_query_generation(s: Dict[str, Any]) -> Dict[str, Any]:
     errors_path = _posix_join(out_base, str(files["errors"]))
     in_domain_path = _posix_join(out_base, str(files["queries_in_domain"]))
     out_domain_path = _posix_join(out_base, str(files["queries_out_domain"]))
+    stats_path = _posix_join(out_base, str(files["stats"]))
 
     # ---- config ----
     qg = s["query_generation"]
@@ -388,164 +394,144 @@ def run_query_generation(s: Dict[str, Any]) -> Dict[str, Any]:
     # ---- LLM ----
     llm, llm_model_name = _build_llm_from_settings(s)
 
-    # ---- counters (MUST be defined BEFORE inner function uses nonlocal) ----
+    # ---- counters ----
     read_errors = 0
-
     total_llm_calls_gen = 0
-    total_llm_calls_domain = 0  # batch calls
+    total_llm_calls_domain = 0
     total_raw_queries = 0
     total_after_post = 0
     total_in_unique = 0
     total_out_unique = 0
-
     total_domain_batches = 0
     total_domain_items_classified = 0
 
-    # ---- read chunks (best-effort) ----
+    # ---- load chunks ----
     def _on_read_error(payload: Dict[str, Any]) -> None:
         nonlocal read_errors
         read_errors += 1
-        payload = dict(payload)
         payload["ts_ms"] = _now_ms()
         append_jsonl(out_store, errors_path, [payload])
 
     rows = list(read_jsonl(in_store, chunks_path, on_error=_on_read_error))
     sampled = _sample_chunks(rows, sampling_cfg)
 
-    # ---- separate dedup maps ----
-    in_map: Dict[str, Dict[str, Any]] = {}
-    out_map: Dict[str, Dict[str, Any]] = {}
+    # ---- seen_ids (resume) ----
+    seen_ids: set[str] = set()
 
-    # ---- batch buffer ----
-    # each: {"real_id": qid_hash, "q_norm": ..., "chunk_id": ...}
+    for path in (in_domain_path, out_domain_path):
+        try:
+            for r in read_jsonl(out_store, path):
+                seen_ids.add(str(r["query_id"]))
+        except Exception:
+            pass
+
+    total_in_unique = sum(1 for _ in read_jsonl(out_store, in_domain_path)) if out_store.exists(in_domain_path) else 0
+    total_out_unique = sum(1 for _ in read_jsonl(out_store, out_domain_path)) if out_store.exists(out_domain_path) else 0
+
+    print(f"[INIT] loaded seen_ids={len(seen_ids)} in={total_in_unique} out={total_out_unique}")
+
     batch_buf: List[Dict[str, Any]] = []
 
-    def _flush_domain_batch() -> None:
+    def _print_state():
+        print(
+            f"[STATE] in={total_in_unique} out={total_out_unique} "
+            f"batch={total_domain_batches} "
+            f"llm_gen={total_llm_calls_gen} "
+            f"llm_domain={total_llm_calls_domain} "
+            f"seen={len(seen_ids)}"
+        )
+
+    def _write_stats_checkpoint():
+        snap = {
+            "ts_ms": _now_ms(),
+            "counters": {
+                "read_errors": read_errors,
+                "llm_calls_generate_queries": total_llm_calls_gen,
+                "llm_calls_domain_classify_batches": total_llm_calls_domain,
+                "domain_classify_batches": total_domain_batches,
+                "domain_classify_items": total_domain_items_classified,
+                "raw_queries_parsed": total_raw_queries,
+                "kept_after_postprocess": total_after_post,
+            },
+            "outputs": {
+                "num_queries_in_domain_unique_written": total_in_unique,
+                "num_queries_out_domain_unique_written": total_out_unique,
+            },
+            "meta": {
+                "llm_model": llm_model_name,
+                "prompt_style": prompt_style,
+                "target_num_in_domain": target_in_domain,
+            },
+        }
+        out_store.write_text(stats_path, json.dumps(snap, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def _flush_domain_batch():
         nonlocal total_llm_calls_domain, total_domain_batches
         nonlocal total_domain_items_classified, total_in_unique, total_out_unique
 
         if not batch_buf:
             return
 
-        items: List[Tuple[str, str]] = [(x["real_id"], x["q_norm"]) for x in batch_buf]
+        items = [(x["real_id"], x["q_norm"]) for x in batch_buf]
         prompt, qlabel_to_real_id = _build_domain_batch_prompt_qstyle(items)
 
-        try:
-            raw = llm.generate(prompt)
-            total_llm_calls_domain += 1
-            total_domain_batches += 1
-        except Exception as e:
-            append_jsonl(
-                out_store,
-                errors_path,
-                [{
-                    "ts_ms": _now_ms(),
-                    "stage": "llm_domain_classify_batch",
-                    "error": f"{type(e).__name__}: {e}",
-                    "batch_size": int(len(batch_buf)),
-                    "real_ids_preview": [x["real_id"] for x in batch_buf[:10]],
-                }],
-            )
-            batch_buf.clear()
-            return
+        raw = llm.generate(prompt)
+        total_llm_calls_domain += 1
+        total_domain_batches += 1
 
-        labels_by_real_id, perr = _parse_domain_batch_qstyle(raw, qlabel_to_real_id)
-        if perr:
-            append_jsonl(
-                out_store,
-                errors_path,
-                [{
-                    "ts_ms": _now_ms(),
-                    "stage": "parse_domain_batch",
-                    "batch_size": int(len(batch_buf)),
-                    "errors": perr,
-                    "llm_output_preview": raw[:500],
-                }],
-            )
+        labels_by_real_id, _ = _parse_domain_batch_qstyle(raw, qlabel_to_real_id)
+
+        new_in_rows = []
+        new_out_rows = []
 
         for x in batch_buf:
             real_id = x["real_id"]
             q_norm = x["q_norm"]
-            chunk_id = x["chunk_id"]
 
             label = labels_by_real_id.get(real_id, "OUT")
             total_domain_items_classified += 1
 
-            if label == "IN":
-                if real_id not in in_map:
-                    in_map[real_id] = {
-                        "query_id": real_id,
-                        "query_text_norm": q_norm,
-                        "source_chunk_ids": [chunk_id],
-                        "llm_model": llm_model_name,
-                        "prompt_style": prompt_style,
-                        "domain": "in",
-                    }
-                    total_in_unique += 1
-                else:
-                    srcs = in_map[real_id]["source_chunk_ids"]
-                    if chunk_id not in srcs:
-                        srcs.append(chunk_id)
-            else:
-                if real_id not in out_map:
-                    out_map[real_id] = {
-                        "query_id": real_id,
-                        "query_text_norm": q_norm,
-                        "source_chunk_ids": [chunk_id],
-                        "llm_model": llm_model_name,
-                        "prompt_style": prompt_style,
-                        "domain": "out",
-                    }
-                    total_out_unique += 1
-                else:
-                    srcs = out_map[real_id]["source_chunk_ids"]
-                    if chunk_id not in srcs:
-                        srcs.append(chunk_id)
+            row_obj = {
+                "query_id": real_id,
+                "query_text_norm": q_norm,
+                "source_chunk_ids": [x["chunk_id"]],
+                "llm_model": llm_model_name,
+                "prompt_style": prompt_style,
+                "domain": "in" if label == "IN" else "out",
+            }
 
+            if label == "IN":
+                new_in_rows.append(row_obj)
+                total_in_unique += 1
+            else:
+                new_out_rows.append(row_obj)
+                total_out_unique += 1
+
+        _print_state()
+
+        if new_in_rows:
+            append_jsonl(out_store, in_domain_path, new_in_rows)
+        if new_out_rows:
+            append_jsonl(out_store, out_domain_path, new_out_rows)
+
+        _write_stats_checkpoint()
         batch_buf.clear()
 
-    # -----------------------------
-    # Loop
-    # -----------------------------
+    # ---------------- Loop ----------------
     for row in sampled:
         if total_in_unique >= target_in_domain:
             break
 
         chunk_id = row.get("chunk_id")
         chunk_text = row.get("chunk_text", "")
-
-        if not chunk_id or not isinstance(chunk_text, str) or not chunk_text.strip():
-            append_jsonl(
-                out_store,
-                errors_path,
-                [{
-                    "ts_ms": _now_ms(),
-                    "stage": "query_generation",
-                    "error": "Missing chunk_id or empty chunk_text",
-                    "row_preview": {k: row.get(k) for k in ("chunk_id", "doc_id", "chunk_index")},
-                }],
-            )
+        if not chunk_id or not chunk_text:
             continue
 
-        max_chunk_chars = _safe_int(prompt_cfg.get("max_chunk_chars", 1800), 1800)
-        passage = chunk_text[:max_chunk_chars]
+        passage = chunk_text[: _safe_int(prompt_cfg.get("max_chunk_chars", 1800), 1800)]
         prompt = _build_query_prompt(passage, prompt_cfg)
 
-        try:
-            raw = llm.generate(prompt)
-            total_llm_calls_gen += 1
-        except Exception as e:
-            append_jsonl(
-                out_store,
-                errors_path,
-                [{
-                    "ts_ms": _now_ms(),
-                    "stage": "llm_generate_queries",
-                    "chunk_id": chunk_id,
-                    "error": f"{type(e).__name__}: {e}",
-                }],
-            )
-            continue
+        raw = llm.generate(prompt)
+        total_llm_calls_gen += 1
 
         queries = _parse_queries(raw)
         total_raw_queries += len(queries)
@@ -556,8 +542,6 @@ def run_query_generation(s: Dict[str, Any]) -> Dict[str, Any]:
             if total_in_unique >= target_in_domain:
                 break
 
-            if not isinstance(q, str):
-                continue
             q = q.strip()
             if len(q) < min_chars:
                 continue
@@ -565,84 +549,30 @@ def run_query_generation(s: Dict[str, Any]) -> Dict[str, Any]:
                 q = q[:max_chars].strip()
 
             q_norm = _normalize_text(q, lower=lower, strip=strip, collapse_whitespace=collapse_whitespace)
-            if len(q_norm) < min_chars:
-                continue
-
             real_id = _make_id(q_norm)
 
-            if avoid_near_duplicates and (real_id in seen_in_chunk):
+            if avoid_near_duplicates and real_id in seen_in_chunk:
                 continue
             seen_in_chunk.add(real_id)
 
-            total_after_post += 1
+            # ✅ 提前 dedup
+            if real_id in seen_ids:
+                continue
 
-            # already classified? just append source
-            if real_id in in_map:
-                srcs = in_map[real_id]["source_chunk_ids"]
-                if chunk_id not in srcs:
-                    srcs.append(chunk_id)
-                continue
-            if real_id in out_map:
-                srcs = out_map[real_id]["source_chunk_ids"]
-                if chunk_id not in srcs:
-                    srcs.append(chunk_id)
-                continue
+            seen_ids.add(real_id)   # ✅ 在进入 batch 前加入
+            total_after_post += 1
 
             batch_buf.append({"real_id": real_id, "q_norm": q_norm, "chunk_id": chunk_id})
 
             if len(batch_buf) >= batch_size:
                 _flush_domain_batch()
-                if total_in_unique >= target_in_domain:
-                    break
 
-    # flush remaining
     _flush_domain_batch()
+    _write_stats_checkpoint()
 
-    # ---- write outputs deterministically ----
-    def _iter_sorted(m: Dict[str, Dict[str, Any]]) -> Iterator[Dict[str, Any]]:
-        for qid in sorted(m.keys()):
-            yield m[qid]
+    return {"status": "done"}
 
-    write_jsonl(out_store, in_domain_path, _iter_sorted(in_map))
-    write_jsonl(out_store, out_domain_path, _iter_sorted(out_map))
 
-    stats = {
-        "ts_ms": _now_ms(),
-        "inputs": {
-            "chunks_path": chunks_path,
-            "num_chunks_total_read": int(len(rows)),
-            "num_chunks_sampled": int(len(sampled)),
-        },
-        "outputs": {
-            "queries_in_domain_path": in_domain_path,
-            "queries_out_domain_path": out_domain_path,
-            "errors_path": errors_path,
-            "num_queries_in_domain_unique_written": int(total_in_unique),
-            "num_queries_out_domain_unique_written": int(total_out_unique),
-        },
-        "counters": {
-            "read_errors": int(read_errors),
-            "llm_calls_generate_queries": int(total_llm_calls_gen),
-            "llm_calls_domain_classify_batches": int(total_llm_calls_domain),
-            "domain_classify_batches": int(total_domain_batches),
-            "domain_classify_items": int(total_domain_items_classified),
-            "domain_batch_size": int(batch_size),
-            "raw_queries_parsed": int(total_raw_queries),
-            "kept_after_postprocess": int(total_after_post),
-        },
-        "meta": {
-            "llm_model": llm_model_name,
-            "prompt_style": prompt_style,
-            "target_num_in_domain": int(target_in_domain),
-            "normalize": {
-                "lower": bool(lower),
-                "strip": bool(strip),
-                "collapse_whitespace": bool(collapse_whitespace),
-            },
-        },
-    }
-
-    return stats
 
 
 def main(config_path: str) -> None:

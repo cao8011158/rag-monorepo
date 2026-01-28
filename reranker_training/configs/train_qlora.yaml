@@ -11,44 +11,49 @@ stores:
 
 # ---------- DATA ----------
 inputs:
-  store: fs_local
-  base: rq_out
-
   files:
+    store: fs_local
+    base: reranker_t_out
     train_path: "data/processed/train.jsonl"
     valid_path: "data/processed/valid.jsonl"
     candidates: pairs.pairwise.jsonl
     pairs: pairs.pairwise.train.jsonl
     stats: run_stats.json
     errors: errors.jsonl
+  chunks:
+    store: fs_local
+    base: ce_out/chunks
+    chunks_file: chunks.jsonl
 
 # Tokenization
 max_length: 512
 # combine strategy:
 # "query_doc" means we encode as (query, doc) pair for cross-encoder.
 pair_format: "query_doc"
+data_split:0.85
 
-# Training
-output_dir: "outputs/run1"
-seed: 42
-num_epochs: 2
-lr: 2.0e-5
-weight_decay: 0.01
-warmup_ratio: 0.05
-per_device_train_batch_size: 8
-per_device_eval_batch_size: 16
-grad_accum_steps: 2
-log_every_steps: 20
-eval_every_steps: 200
-save_every_steps: 200
-max_steps: null # set integer to cap training
+Training:
+  Optimizer: AdamW
+  output_dir: "content/drive/MyDrive/rag-kb-data/run1"
+  seed: 42
+  num_epochs: 2
+  # Pairwise sampling
+  # Re-sample negatives each epoch:
+  negs_per_query_per_epoch: 3
+  # if you already have hard negatives, keep it true; if not, mix random:
+  mix_random_negs: true
+  random_neg_ratio: 0.25
 
-# Pairwise sampling
-# Re-sample negatives each epoch:
-negs_per_query_per_epoch: 2
-# if you already have hard negatives, keep it true; if not, mix random:
-mix_random_negs: true
-random_neg_ratio: 0.25
+  lr: 2.0e-5
+  weight_decay: 0.01
+  warmup_ratio: 0.05
+  per_device_train_batch_size: 8
+  per_device_eval_batch_size: 16
+  grad_accum_steps: 2
+  log_every_steps: 20
+  eval_every_steps: 200
+  save_every_steps: 200
+  max_steps: null # set integer to cap training
 
 # QLoRA / LoRA
 lora:
