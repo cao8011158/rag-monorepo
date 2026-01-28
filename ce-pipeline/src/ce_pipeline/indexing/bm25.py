@@ -31,3 +31,6 @@ def save_bm25(store: Store, path: str, bm25: BM25Okapi, doc_ids: List[str]) -> N
 def load_bm25(store: Store, path: str) -> BM25Artifact:
     data = store.read_bytes(path)
     return pickle.loads(data)
+
+def get_scores(self, tokenized_query):
+    return self.bm25.get_scores(tokenized_query)
