@@ -176,7 +176,7 @@ class HybridRetriever:
         key_to_idx = {k: i for i, k in enumerate(idx_to_key)}
 
         # Load embedder config
-        emb_cfg = s["embedding"]
+        emb_cfg = s["models"]["embedding"]
         instr = emb_cfg["instructions"]
         embedder = DualInstructEmbedder(
             model_name=emb_cfg["model_name"],
