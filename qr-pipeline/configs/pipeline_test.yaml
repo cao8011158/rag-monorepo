@@ -36,8 +36,7 @@ outputs:
   files:
     queries_in_domain: queries/in_domain.jsonl
     queries_out_domain: queries/out_domain.jsonl
-    candidates: pairs.pairwise.jsonl
-    pairs: pairs.pairwise.train.jsonl
+    pairs: pairs/query_pack.jsonl
     stats: run_stats.json
     errors: errors.jsonl
 
