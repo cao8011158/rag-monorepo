@@ -9,11 +9,11 @@ import time
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, TypedDict, cast
 
+from qr_pipeline.io.jsonl import append_jsonl, read_jsonl, write_jsonl
+from qr_pipeline.llm.pairing import build_pairs_for_query
+from qr_pipeline.llm.retrieval import HybridRetriever
 from qr_pipeline.settings import load_settings
 from qr_pipeline.stores.registry import build_store_registry
-from qr_pipeline.io.jsonl import read_jsonl, write_jsonl, append_jsonl
-from qr_pipeline.llm.retrieval import HybridRetriever
-from qr_pipeline.llm.pairing import build_pairs_for_query
 
 
 # -----------------------------
@@ -254,6 +254,9 @@ def run_pairing(
     只从 outputs.files.queries_in_domain 读取 query。
     每个 query 输出 1 条 QueryPack，写入 outputs.files.pairs。
     缓冲 buffer_size 条后 append，一次 flush 打印一次状态。
+
+    - best_effort=True: 捕获每条 query 的异常，写入 errors.jsonl，并继续处理后续 query
+    - best_effort=False (fail fast): 不捕获异常，直接抛出
     """
     t0 = _now()
     settings: Dict[str, Any] = load_settings(config_path)
@@ -282,7 +285,7 @@ def run_pairing(
     chunks_store = stores[chunks_store_name]
     chunks_path = _join_posix(chunks_base, chunks_file)
 
-    # -------- error logger --------
+    # -------- error logger (best-effort only) --------
     def _log_err(payload: Dict[str, Any]) -> None:
         try:
             append_jsonl(out_store, errors_path, [payload])
@@ -313,14 +316,18 @@ def run_pairing(
     t_s1 = _now()
 
     # -------- reset outputs --------
+    # pairs: always reset
     try:
         write_jsonl(out_store, pairs_path, [])
     except Exception:
         pass
-    try:
-        write_jsonl(out_store, errors_path, [])
-    except Exception:
-        pass
+
+    # errors: only meaningful in best-effort
+    if best_effort:
+        try:
+            write_jsonl(out_store, errors_path, [])
+        except Exception:
+            pass
 
     num_processed = 0
     num_written = 0
@@ -328,72 +335,78 @@ def run_pairing(
     buf: List[QueryPack] = []
     last_flush_t = _now()
 
-    t_loop0 = _now()
-    for idx, row in enumerate(query_rows, start=1):
-        try:
-            query_obj = _row_to_query(row)
-            qtext = _safe_str(query_obj.get("query_text")).strip()
-            if not qtext:
-                continue
+    def _process_one(row: Dict[str, Any]) -> None:
+        nonlocal num_processed, num_written, buf, last_flush_t
 
-            src_ids_full = row.get("source_chunk_ids") or []
-            if not src_ids_full:
-                raise ValueError("query row missing source_chunk_ids")
+        query_obj = _row_to_query(row)
+        qtext = _safe_str(query_obj.get("query_text")).strip()
+        if not qtext:
+            return
 
-            src_id0 = _safe_str(src_ids_full[0]).strip()
-            if not src_id0:
-                raise ValueError("source_chunk_ids[0] is empty")
+        src_ids_full = row.get("source_chunk_ids") or []
+        if not src_ids_full:
+            raise ValueError("query row missing source_chunk_ids")
 
-            if src_id0 not in source_map:
-                raise KeyError(f"source_chunk_id not found in chunks.jsonl: {src_id0}")
+        src_id0 = _safe_str(src_ids_full[0]).strip()
+        if not src_id0:
+            raise ValueError("source_chunk_ids[0] is empty")
 
-            source_doc = source_map[src_id0]
+        if src_id0 not in source_map:
+            raise KeyError(f"source_chunk_id not found in chunks.jsonl: {src_id0}")
 
-            # retrieval -> candidate ChunkDocs (RRF order preserved)
-            retrieved_items: List[Dict[str, Any]] = retriever.retrieve(qtext)
-            candidate_docs = _convert_retrieval_items_to_chunkdocs(retrieved_items)
+        source_doc = source_map[src_id0]
 
-            # pairing (new API): returns (pack, stats)
-            pack, stats = build_pairs_for_query(
-                query=query_obj,
-                source_doc=source_doc,
-                candidate_docs=candidate_docs,
-                llm=llm,
-                embedder=embedder,
+        # retrieval -> candidate ChunkDocs (RRF order preserved)
+        retrieved_items: List[Dict[str, Any]] = retriever.retrieve(qtext)
+        candidate_docs = _convert_retrieval_items_to_chunkdocs(retrieved_items)
+
+        # pairing (new API): returns (pack, stats)
+        pack, stats = build_pairs_for_query(
+            query=query_obj,
+            source_doc=source_doc,
+            candidate_docs=candidate_docs,
+            llm=llm,
+            embedder=embedder,
+        )
+
+        # ensure stats is present in pack.meta.stats
+        if isinstance(pack, dict):
+            meta = pack.get("meta") if isinstance(pack.get("meta"), dict) else {}
+            if not isinstance(meta.get("stats"), dict):
+                meta["stats"] = stats
+            pack["meta"] = meta
+
+        buf.append(cast(QueryPack, pack))
+        num_processed += 1
+
+        if len(buf) >= int(buffer_size):
+            n = _flush_buffer(out_store=out_store, pairs_path=pairs_path, buf=buf)
+            num_written += n
+            now = _now()
+            print(
+                f"[run_pairing] flushed={n} processed={num_processed}/{len(query_rows)} "
+                f"written={num_written} errors={num_errors} since_last_flush_sec={now - last_flush_t:.2f}"
             )
+            last_flush_t = now
 
-            # ensure stats is present in pack.meta.stats
-            if isinstance(pack, dict):
-                meta = pack.get("meta") if isinstance(pack.get("meta"), dict) else {}
-                if not isinstance(meta.get("stats"), dict):
-                    meta["stats"] = stats
-                pack["meta"] = meta
+    t_loop0 = _now()
 
-            buf.append(cast(QueryPack, pack))
-            num_processed += 1
-
-            if len(buf) >= int(buffer_size):
-                n = _flush_buffer(out_store=out_store, pairs_path=pairs_path, buf=buf)
-                num_written += n
-                now = _now()
-                print(
-                    f"[run_pairing] flushed={n} processed={num_processed}/{len(query_rows)} "
-                    f"written={num_written} errors={num_errors} since_last_flush_sec={now - last_flush_t:.2f}"
-                )
-                last_flush_t = now
-
-        except Exception as e:
-            num_errors += 1
-            payload = {
-                "stage": "run_pairing",
-                "error": f"{type(e).__name__}: {e}",
-                "query_id": _safe_str(row.get("query_id")),
-                "query_text_norm": _safe_str(row.get("query_text_norm"))[:300],
-            }
-            if best_effort:
+    for idx, row in enumerate(query_rows, start=1):
+        if best_effort:
+            try:
+                _process_one(row)
+            except Exception as e:
+                num_errors += 1
+                payload = {
+                    "stage": "run_pairing",
+                    "error": f"{type(e).__name__}: {e}",
+                    "query_id": _safe_str(row.get("query_id")),
+                    "query_text_norm": _safe_str(row.get("query_text_norm"))[:300],
+                }
                 _log_err(payload)
-            else:
-                raise
+        else:
+            # fail fast: no try/except
+            _process_one(row)
 
     # final flush
     if buf:
@@ -444,7 +457,11 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     p = argparse.ArgumentParser(description="Run pairing (new API): queries_in_domain -> QueryPack jsonl.")
     p.add_argument("--config", required=True, help="Path to pipeline yaml, e.g. configs/pipeline.yaml")
     p.add_argument("--buffer", type=int, default=15, help="Flush buffer size (QueryPack rows)")
-    p.add_argument("--fail_fast", action="store_true", help="Fail fast instead of best-effort.")
+    p.add_argument(
+        "--fail_fast",
+        action="store_true",
+        help="Fail fast: do NOT catch per-query exceptions; crash immediately for debugging.",
+    )
     args = p.parse_args(list(argv) if argv is not None else None)
 
     settings = load_settings(args.config)
@@ -468,17 +485,31 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     # Embedder config: embedding
     from qr_pipeline.processing.embedder import DualInstructEmbedder
 
-    emb_cfg = settings.get("embedding", {}) if isinstance(settings.get("embedding", {}), dict) else {}
-    instr_cfg = emb_cfg.get("instructions", {}) if isinstance(emb_cfg.get("instructions", {}), dict) else {}
+    models_cfg = settings.get("models", {})
+    emb_cfg = models_cfg.get("embedding", {})
+    if not isinstance(emb_cfg, dict):
+        emb_cfg = {}
+
+    instr_cfg = emb_cfg.get("instructions", {})
+    if not isinstance(instr_cfg, dict):
+        instr_cfg = {}
+
+    model_name = _safe_str(
+        emb_cfg.get("model") or emb_cfg.get("model_name")
+    )
+
+    if not model_name:
+        raise ValueError("models.embedding.model is required in config")
 
     embedder = DualInstructEmbedder(
-        model_name=_safe_str(emb_cfg.get("model_name", "")),
+        model_name=model_name,
         passage_instruction=_safe_str(instr_cfg.get("passage", "")),
         query_instruction=_safe_str(instr_cfg.get("query", "")),
         batch_size=int(emb_cfg.get("batch_size", 64) or 64),
         normalize_embeddings=bool(emb_cfg.get("normalize_embeddings", True)),
         device=emb_cfg.get("device"),  # None / "cpu" / "cuda"
     )
+
 
     res = run_pairing(
         args.config,

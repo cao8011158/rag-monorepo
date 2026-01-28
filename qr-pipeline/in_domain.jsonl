@@ -1,0 +1,2 @@
+{"query_id":"07f82ee0e8956ee74a19e2fd","query_text_norm":"what was the significance of the pittsburgh post-gazette being started in 1786?","source_chunk_ids":["42a71bf079e9fc7c51aecc5c"],"llm_model":"Qwen/Qwen2.5-7B-Instruct","prompt_style":"information-seeking","domain":"in"}
+{"query_id":"16f077fc34dc19ae3b5c724c","query_text_norm":"how did suburbanization affect pittsburgh's population in the later 20th century?","source_chunk_ids":["a2de3f40bed3f76d0477daac"],"llm_model":"Qwen/Qwen2.5-7B-Instruct","prompt_style":"information-seeking","domain":"in"}
