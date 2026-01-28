@@ -38,9 +38,10 @@ Training:
   seed: 42
   num_epochs: 2
   # Pairwise sampling
-  # Re-sample negatives each epoch:
-  negs_per_query_per_epoch: 3
-  # if you already have hard negatives, keep it true; if not, mix random:
+  # Re-sample hard negatives each epoch:
+    negs_per_query_per_epoch: 3
+    randopm_negative_per_query: 1
+  # if you already have hard negatives/cadidates, keep it true; if not, mix random:
   mix_random_negs: true
   random_neg_ratio: 0.25
 

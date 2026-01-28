@@ -8,25 +8,48 @@ from typing import Any, Dict, List, Sequence, Tuple, TypedDict
 
 
 # -----------------------------
-# Schemas
+# Schemas (UPDATED)
 # -----------------------------
-class Document(TypedDict):
+class ChunkDoc(TypedDict, total=False):
+    # required
+    chunk_id: str
     doc_id: str
-    text: str
+    chunk_index: int
+    chunk_text: str
+    chunk_text_hash: str
+
+    # optional (copied from document)
+    url: str
+    title: str
+    source: str
+    content_hash: str
+    content_type: str
+    fetched_at: str
+    run_date: str
 
 
-class PairSample(TypedDict):
+class Query(TypedDict, total=False):
+    # required
     query_text: str
-    positive: Document
-    negatives: List[Document]
-    source_chunk: str
+    # NEW: store which source chunk(s) produced this query
+    source_chunk_ids: List[str]
+
+    # optional
+    query_id: str
+    domain: str
+
+
+class QueryPack(TypedDict):
+    query: Query
+    positives: List[ChunkDoc]
+    negatives: List[ChunkDoc]
+    meta: Dict[str, Any]
 
 
 # -----------------------------
 # Text helpers
 # -----------------------------
 _WS_RE = re.compile(r"\s+", re.UNICODE)
-_SENT_SPLIT = re.compile(r"(?<=[。！？.!?])\s+|\n+", re.UNICODE)
 
 
 def _norm_text(s: str) -> str:
@@ -35,23 +58,6 @@ def _norm_text(s: str) -> str:
 
 def _sha1(s: str) -> str:
     return hashlib.sha1((s or "").encode("utf-8")).hexdigest()
-
-
-def _best_effort_contains(haystack: str, needle: str) -> bool:
-    if not needle:
-        return False
-    if needle in haystack:
-        return True
-    return _norm_text(needle) in _norm_text(haystack)
-
-
-def _extract_source_chunk(source_doc_text: str, max_chars: int = 260) -> str:
-    t = (source_doc_text or "").strip()
-    if not t:
-        return ""
-    parts = [p.strip() for p in _SENT_SPLIT.split(t) if p.strip()]
-    s = parts[0] if parts else t
-    return s if len(s) <= max_chars else (s[:max_chars] + " ...")
 
 
 def _safe_json_loads(s: str) -> Dict[str, Any]:
@@ -79,34 +85,33 @@ def _safe_json_loads(s: str) -> Dict[str, Any]:
 # -----------------------------
 # Candidate labeling (C1, C2, ...)
 # -----------------------------
-def _label_candidates(candidate_docs: Sequence[Document]) -> Tuple[List[Document], Dict[str, str], Dict[str, str]]:
+def _label_candidates(candidate_docs: Sequence[ChunkDoc]) -> Tuple[List[ChunkDoc], Dict[str, str], Dict[str, str]]:
     """
     Return:
-      - candidate_docs (as list, same order)
-      - label_to_docid: {"C1": "<real_doc_id>", ...}
-      - docid_to_label: {"<real_doc_id>": "C1", ...}
+      - docs (list, same order)
+      - label_to_chunkid: {"C1": "<chunk_id>", ...}
+      - chunkid_to_label: {"<chunk_id>": "C1", ...}
     Labels are assigned by order (RRF order).
     """
     docs = list(candidate_docs)
-    label_to_docid: Dict[str, str] = {}
-    docid_to_label: Dict[str, str] = {}
+    label_to_chunkid: Dict[str, str] = {}
+    chunkid_to_label: Dict[str, str] = {}
     for i, d in enumerate(docs, start=1):
         lab = f"C{i}"
-        rid = d["doc_id"]
-        label_to_docid[lab] = rid
-        docid_to_label[rid] = lab
-    return docs, label_to_docid, docid_to_label
+        cid = d["chunk_id"]
+        label_to_chunkid[lab] = cid
+        chunkid_to_label[cid] = lab
+    return docs, label_to_chunkid, chunkid_to_label
 
 
 # -----------------------------
-# Prompting (uses C1/C2 labels)
+# Prompting (positives only) - NO url/title
 # -----------------------------
 def build_candidate_classify_prompt(
     query_text: str,
-    labeled_docs: Sequence[Tuple[str, Document]],  # [("C1", doc), ...]
+    labeled_docs: Sequence[Tuple[str, ChunkDoc]],  # [("C1", doc), ...]
     *,
     max_extra_positives: int = 2,
-    require_evidence: bool = True,
     include_one_shot: bool = True,
 ) -> str:
     per_doc_cap = 900
@@ -117,28 +122,26 @@ def build_candidate_classify_prompt(
 
     lines: List[str] = []
     lines.append("You are a strict judge that matches a query to candidate documents.")
+    lines.append("Precision is more important than recall.")
     lines.append("")
     lines.append("Task:")
-    lines.append("- You MUST evaluate EACH candidate document independently (one-by-one).")
-    lines.append("- A document is POSITIVE ONLY if it directly answers the query (not just related).")
-    lines.append("- All documents that are not POSITIVE must be NEGATIVE.")
-    if require_evidence:
-        lines.append("- For every POSITIVE, provide EVIDENCE as a verbatim quote copied from that document.")
+    lines.append("- Evaluate EACH candidate document independently.")
+    lines.append("- A document is POSITIVE only if it directly and explicitly answers the query.")
+    lines.append("- If you are unsure, DO NOT mark it as positive.")
+    lines.append(f"- You may output at most {max_extra_positives} POSITIVE documents.")
     lines.append("")
     lines.append("Hard rules:")
-    lines.append("- You MUST only use the provided labels (C1, C2, ...) (no other ids).")
-    lines.append("- Output MUST be a single valid JSON object only. No extra text. No markdown.")
+    lines.append("- You MUST only use the provided labels (C1, C2, ...).")
+    lines.append("- Output MUST be a single valid JSON object only.")
+    lines.append("- No extra text. No markdown. No explanations.")
     lines.append("")
     lines.append("Output JSON schema:")
     lines.append("{")
-    if require_evidence:
-        lines.append('  "positives": [{"doc_id": "C2", "evidence": "verbatim quote"}],')
-    else:
-        lines.append('  "positives": [{"doc_id": "C2"}],')
-    lines.append('  "negatives": ["C1", "C3"]')
+    lines.append('  "positives": [')
+    lines.append('    { "doc_id": "C2", "evidence": "verbatim quote from the document" }')
+    lines.append("  ]")
     lines.append("}")
     lines.append("")
-
     if include_one_shot:
         lines.append("One-shot example (FORMAT ONLY; do not reuse the content):")
         lines.append("Query: What is the capital of France?")
@@ -147,11 +150,16 @@ def build_candidate_classify_prompt(
         lines.append("  text: Paris is the capital and most populous city of France.")
         lines.append("- doc_id: C2")
         lines.append("  text: Berlin is the capital of Germany.")
+        lines.append("")
         lines.append("Output JSON:")
-        if require_evidence:
-            lines.append('{ "positives": [{"doc_id": "C1", "evidence": "Paris is the capital and most populous city of France."}], "negatives": ["C2"] }')
-        else:
-            lines.append('{ "positives": [{"doc_id": "C1"}], "negatives": ["C2"] }')
+        lines.append("{")
+        lines.append('  "positives": [')
+        lines.append('    {')
+        lines.append('      "doc_id": "C1",')
+        lines.append('      "evidence": "Paris is the capital and most populous city of France."')
+        lines.append("    }")
+        lines.append("  ]")
+        lines.append("}")
         lines.append("")
 
     lines.append(f"Query: {query_text}")
@@ -159,83 +167,80 @@ def build_candidate_classify_prompt(
     lines.append("Candidate documents:")
     for lab, d in labeled_docs:
         lines.append(f"- doc_id: {lab}")
-        lines.append(f"  text: {_clip(d['text'])}")
+        lines.append(f"  text: {_clip(d.get('chunk_text', ''))}")
     return "\n".join(lines)
 
 
 # -----------------------------
-# Main
+# Main (UPDATED I/O + Output Pack)
 # -----------------------------
 def build_pairs_for_query(
     *,
-    query_text: str,
-    source_doc: Document,                 # known positive
-    candidate_docs: Sequence[Document],   # RRF-ordered candidates (may include source)
+    query: Query,
+    source_doc: ChunkDoc,                 # known positive (a chunk)
+    candidate_docs: Sequence[ChunkDoc],   # RRF-ordered candidates (may include source)
     llm: Any,                             # llm.generate(prompt)->str
     embedder: Any,                        # embedder.encode_passages(list[str])->np.ndarray (normalized)
     # knobs
     max_extra_positives: int = 2,
-    require_evidence: bool = True,
     cosine_threshold: float = 0.92,
-    num_hard_negatives: int = 6,
+    num_hard_negatives: int = 15,
     enable_text_hash_dedup: bool = True,
     include_one_shot: bool = True,
-) -> Tuple[List[PairSample], Dict[str, Any]]:
+) -> Tuple[QueryPack, Dict[str, Any]]:
     if not hasattr(llm, "generate"):
         raise TypeError("llm must have method .generate(prompt)->str.")
     if not hasattr(embedder, "encode_passages"):
         raise TypeError("embedder must have method .encode_passages(list[str])->np.ndarray.")
 
+    query_text = str(query.get("query_text") or "").strip()
+    if not query_text:
+        raise ValueError("query['query_text'] is required and must be non-empty.")
+
+    # Ensure source_chunk_ids exists (best-effort)
+    if "source_chunk_ids" not in query or not isinstance(query.get("source_chunk_ids"), list):
+        query["source_chunk_ids"] = [source_doc["chunk_id"]]
+
     stats: Dict[str, Any] = {
         "num_candidates_in": len(candidate_docs),
         "max_extra_positives": max_extra_positives,
-        "require_evidence": require_evidence,
         "cosine_threshold": cosine_threshold,
         "num_hard_negatives": num_hard_negatives,
         "enable_text_hash_dedup": enable_text_hash_dedup,
         "include_one_shot": include_one_shot,
     }
 
-    # ---- doc lookup
-    doc_by_id: Dict[str, Document] = {}
+    # ---- doc lookup by chunk_id
+    doc_by_id: Dict[str, ChunkDoc] = {}
     for d in candidate_docs:
-        did = d["doc_id"]
-        if did not in doc_by_id:
-            doc_by_id[did] = d
-    doc_by_id[source_doc["doc_id"]] = source_doc
+        cid = d["chunk_id"]
+        if cid not in doc_by_id:
+            doc_by_id[cid] = d
+    doc_by_id[source_doc["chunk_id"]] = source_doc
 
-    # ---- source_chunk (traceability)
-    source_chunk = _extract_source_chunk(source_doc.get("text", ""))
-
-    # ---- LLM sees only extra candidates (exclude source)
-    cand_for_llm: List[Document] = [d for d in candidate_docs if d["doc_id"] != source_doc["doc_id"]]
+    # ---- LLM sees only extra candidates (exclude source chunk)
+    cand_for_llm: List[ChunkDoc] = [d for d in candidate_docs if d["chunk_id"] != source_doc["chunk_id"]]
     stats["num_candidates_for_llm"] = len(cand_for_llm)
 
     # ---- label them as C1, C2, ... (RRF order)
     cand_for_llm_list, label_to_real, real_to_label = _label_candidates(cand_for_llm)
-    valid_labels = set(label_to_real.keys())  # {"C1","C2",...}
-
-    labeled_docs: List[Tuple[str, Document]] = [(real_to_label[d["doc_id"]], d) for d in cand_for_llm_list]
+    valid_labels = set(label_to_real.keys())
+    labeled_docs: List[Tuple[str, ChunkDoc]] = [(real_to_label[d["chunk_id"]], d) for d in cand_for_llm_list]
 
     # ---- prompt + parse
     prompt = build_candidate_classify_prompt(
         query_text=query_text,
         labeled_docs=labeled_docs,
         max_extra_positives=max_extra_positives,
-        require_evidence=require_evidence,
         include_one_shot=include_one_shot,
     )
     raw = llm.generate(prompt)
     out = _safe_json_loads(raw)
-
     pos_raw = out.get("positives") or []
-    neg_raw = out.get("negatives") or []
 
     # ---- 1) collect ALL valid LLM positives (labels), do NOT truncate yet
     llm_pos_labels: List[str] = []
     invalid_label = 0
-    invalid_evidence = 0
-
     if isinstance(pos_raw, list):
         for item in pos_raw:
             if not isinstance(item, dict):
@@ -244,20 +249,9 @@ def build_pairs_for_query(
             if lab not in valid_labels:
                 invalid_label += 1
                 continue
-
-            real_id = label_to_real[lab]
-
-            if require_evidence:
-                ev = item.get("evidence")
-                ev_s = str(ev).strip() if ev is not None else ""
-                if not ev_s or not _best_effort_contains(doc_by_id[real_id]["text"], ev_s):
-                    invalid_evidence += 1
-                    continue
-
             llm_pos_labels.append(lab)
 
-    # de-dup labels preserving first occurrence, already in RRF label order typically,
-    # but we still sort by numeric suffix to guarantee RRF order.
+    # de-dup labels preserving first occurrence, then sort by numeric suffix to guarantee RRF order.
     seen_pos: set[str] = set()
     llm_pos_labels_uniq: List[str] = []
     for lab in llm_pos_labels:
@@ -267,26 +261,24 @@ def build_pairs_for_query(
         llm_pos_labels_uniq.append(lab)
 
     def _label_rank(lab: str) -> int:
-        # "C12" -> 12 ; fallback big number
         m = re.match(r"^C(\d+)$", lab)
         return int(m.group(1)) if m else 10**9
 
     llm_pos_labels_uniq.sort(key=_label_rank)
 
     stats["invalid_label"] = invalid_label
-    stats["invalid_evidence"] = invalid_evidence
     stats["llm_pos_valid_total"] = len(llm_pos_labels_uniq)
 
-    # map labels -> real doc_ids
+    # map labels -> real chunk_ids
     llm_pos_real_ids: List[str] = [label_to_real[lab] for lab in llm_pos_labels_uniq]
 
     # ---- 2) cosine dedup over (source + ALL llm positives), keep source first
-    pos_ids_pre_dedup: List[str] = [source_doc["doc_id"]] + llm_pos_real_ids
+    pos_ids_pre_dedup: List[str] = [source_doc["chunk_id"]] + llm_pos_real_ids
 
     if len(pos_ids_pre_dedup) <= 1:
         kept_pos_ids = pos_ids_pre_dedup
     else:
-        pos_texts = [doc_by_id[did]["text"] for did in pos_ids_pre_dedup]
+        pos_texts = [doc_by_id[cid]["chunk_text"] for cid in pos_ids_pre_dedup]
         pos_vecs = embedder.encode_passages(pos_texts)  # normalized (P, D)
 
         kept_pos_ids = [pos_ids_pre_dedup[0]]  # source always first
@@ -305,7 +297,7 @@ def build_pairs_for_query(
 
     stats["num_pos_after_cos_dedup"] = len(kept_pos_ids)
 
-    # ---- 3) truncate extras AFTER dedup (this is your correction)
+    # ---- 3) truncate extras AFTER dedup
     extras_after_dedup = kept_pos_ids[1:]
     extras_after_dedup = extras_after_dedup[: max(0, int(max_extra_positives))]
     kept_pos_ids = [kept_pos_ids[0]] + extras_after_dedup
@@ -315,33 +307,14 @@ def build_pairs_for_query(
 
     kept_pos_set = set(kept_pos_ids)
 
-    # ---- 4) negatives pool (preserve RRF order)
-    # default: everything else in cand_for_llm excluding kept positives
-    neg_pool_real_ids: List[str] = [d["doc_id"] for d in cand_for_llm_list if d["doc_id"] not in kept_pos_set]
-
-    # if LLM provides explicit negatives labels, use strict pool (still RRF order)
-    if isinstance(neg_raw, list) and len(neg_raw) > 0:
-        llm_neg_labels = [str(x).strip() for x in neg_raw if str(x).strip()]
-        llm_neg_labels = [lab for lab in llm_neg_labels if lab in valid_labels]
-        # de-dup + sort by RRF label rank
-        seen_n: set[str] = set()
-        llm_neg_labels_uniq: List[str] = []
-        for lab in llm_neg_labels:
-            if lab in seen_n:
-                continue
-            seen_n.add(lab)
-            llm_neg_labels_uniq.append(lab)
-        llm_neg_labels_uniq.sort(key=_label_rank)
-
-        if llm_neg_labels_uniq:
-            neg_pool_real_ids = [label_to_real[lab] for lab in llm_neg_labels_uniq if label_to_real[lab] not in kept_pos_set]
-
+    # ---- 4) negatives pool (preserve RRF order): complement of positives
+    neg_pool_real_ids: List[str] = [d["chunk_id"] for d in cand_for_llm_list if d["chunk_id"] not in kept_pos_set]
     stats["num_neg_pool"] = len(neg_pool_real_ids)
 
     # ---- 5) negative cosine filter vs each positive (>threshold => drop)
-    neg_texts = [doc_by_id[nid]["text"] for nid in neg_pool_real_ids]
+    neg_texts = [doc_by_id[nid]["chunk_text"] for nid in neg_pool_real_ids]
     if neg_texts:
-        pos_texts2 = [doc_by_id[did]["text"] for did in kept_pos_ids]
+        pos_texts2 = [doc_by_id[pid]["chunk_text"] for pid in kept_pos_ids]
         pos_vecs2 = embedder.encode_passages(pos_texts2)  # (P, D)
         neg_vecs = embedder.encode_passages(neg_texts)    # (N, D)
 
@@ -362,7 +335,7 @@ def build_pairs_for_query(
         seen_h: set[str] = set()
         deduped_neg_ids: List[str] = []
         for nid in filtered_neg_ids:
-            h = _sha1(_norm_text(doc_by_id[nid]["text"]))
+            h = _sha1(_norm_text(doc_by_id[nid]["chunk_text"]))
             if h in seen_h:
                 continue
             seen_h.add(h)
@@ -375,21 +348,18 @@ def build_pairs_for_query(
     # ---- 7) cap negatives AFTER all filters, keep RRF order
     k = max(0, int(num_hard_negatives))
     final_neg_ids = deduped_neg_ids[:k]
-    neg_docs_final: List[Document] = [doc_by_id[nid] for nid in final_neg_ids]
-
+    neg_docs_final: List[ChunkDoc] = [doc_by_id[nid] for nid in final_neg_ids]
     stats["num_neg_final"] = len(final_neg_ids)
 
-    # ---- 8) build samples: one per positive (negatives shared)
-    samples: List[PairSample] = []
-    for did in kept_pos_ids:
-        samples.append(
-            PairSample(
-                query_text=query_text,
-                positive=doc_by_id[did],
-                negatives=neg_docs_final,
-                source_chunk=source_chunk,
-            )
-        )
+    # ---- 8) build ONE packed sample per query (positives + negatives)
+    pos_docs_final: List[ChunkDoc] = [doc_by_id[pid] for pid in kept_pos_ids]
 
-    stats["num_samples"] = len(samples)
-    return samples, stats
+    pack: QueryPack = {
+        "query": query,
+        "positives": pos_docs_final,
+        "negatives": neg_docs_final,
+        "meta": {"stats": stats},
+    }
+
+    stats["num_samples"] = 1
+    return pack, stats

@@ -36,7 +36,6 @@ outputs:
   files:
     queries_in_domain: queries/in_domain.jsonl
     queries_out_domain: queries/out_domain.jsonl
-    candidates: pairs.pairwise.jsonl
     pairs: pairs.pairwise.train.jsonl
     stats: run_stats.json
     errors: errors.jsonl
@@ -152,7 +151,7 @@ pair_construction:
     # min_cosine: 0.85
 
   hard_negatives:
-    num_per_query: 6
+    num_per_query: 15
     strategy: top_rank_excluding_pos # top_rank_excluding_pos | score_band | mixed
     # avoid false negatives that are too similar to positive
     filters:
