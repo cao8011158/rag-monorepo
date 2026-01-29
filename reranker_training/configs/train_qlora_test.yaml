@@ -22,7 +22,7 @@ inputs:
     base: ce_out/chunks
     chunks_file: chunks.jsonl
 
-outputs: 
+outputs:
   files:
     store: fs_local
     base: reranker_out
@@ -30,12 +30,11 @@ outputs:
     valid_path: "processed/valid_query_pack.jsonl"
     train_pair_path: "processed/train_pair_epoch_n.jsonl"
 
-
 # Tokenization
 max_length: 512
 # combine strategy:  "query_doc" means we encode as (query, doc) pair for cross-encoder.
 pair_format: "query_doc"
-data_split:0.85
+data_split: 0.85
 
 Training:
   Optimizer: AdamW
