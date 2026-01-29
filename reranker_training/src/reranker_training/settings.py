@@ -54,7 +54,7 @@ def apply_defaults(raw: SettingsDict) -> SettingsDict:
     - outputs:
         files: {store, base, train_path, valid_path, train_pair_path}
     - max_length, pair_format, data_split
-    - Training: {Optimizer, output_dir, seed, num_epochs, ...}
+    - training: {Optimizer, output_dir, seed, num_epochs, ...}
     - lora: {enabled, qlora_4bit, r, alpha, dropout, target_modules}
     - bf16, fp16, num_workers
     """
@@ -106,9 +106,9 @@ def apply_defaults(raw: SettingsDict) -> SettingsDict:
     s.setdefault("data_split", 0.85)
 
     # ---- training ----
-    s.setdefault("Training", {})
-    _must_be_mapping(s["Training"], "Training")
-    tr = s["Training"]
+    s.setdefault("training", {})
+    _must_be_mapping(s["training"], "training")
+    tr = s["training"]
     tr.setdefault("Optimizer", "AdamW")
     tr.setdefault("output_dir", "")
     tr.setdefault("seed", 42)
@@ -215,31 +215,31 @@ def validate_settings(s: SettingsDict) -> None:
         raise ValueError(f"data_split must be in (0,1), got {split}")
 
     # ---- training ----
-    tr = s["Training"]
-    _must_be_mapping(tr, "Training")
-    _require_nonempty_str(tr.get("Optimizer"), "Training.Optimizer")
-    _require_nonempty_str(tr.get("output_dir"), "Training.output_dir")
-    _as_int(tr.get("seed"), "Training.seed")
-    _as_int(tr.get("num_epochs"), "Training.num_epochs", min_value=1)
+    tr = s["training"]
+    _must_be_mapping(tr, "training")
+    _require_nonempty_str(tr.get("Optimizer"), "training.Optimizer")
+    _require_nonempty_str(tr.get("output_dir"), "training.output_dir")
+    _as_int(tr.get("seed"), "training.seed")
+    _as_int(tr.get("num_epochs"), "training.num_epochs", min_value=1)
 
-    _as_int(tr.get("hard_negative_per_positive"), "Training.hard_negative_per_positive", min_value=0)
-    _as_int(tr.get("random_negative_per_positive"), "Training.random_negative_per_positive", min_value=0)
-    _as_float(tr.get("random_neg_ratio"), "Training.random_neg_ratio", min_value=0.0, max_value=1.0)
+    _as_int(tr.get("hard_negative_per_positive"), "training.hard_negative_per_positive", min_value=0)
+    _as_int(tr.get("random_negative_per_positive"), "training.random_negative_per_positive", min_value=0)
+    _as_float(tr.get("random_neg_ratio"), "training.random_neg_ratio", min_value=0.0, max_value=1.0)
 
-    _as_float(tr.get("lr"), "Training.lr", min_value=0.0)
-    _as_float(tr.get("weight_decay"), "Training.weight_decay", min_value=0.0)
-    _as_float(tr.get("warmup_ratio"), "Training.warmup_ratio", min_value=0.0, max_value=1.0)
+    _as_float(tr.get("lr"), "training.lr", min_value=0.0)
+    _as_float(tr.get("weight_decay"), "training.weight_decay", min_value=0.0)
+    _as_float(tr.get("warmup_ratio"), "training.warmup_ratio", min_value=0.0, max_value=1.0)
 
-    _as_int(tr.get("per_device_train_batch_size"), "Training.per_device_train_batch_size", min_value=1)
-    _as_int(tr.get("per_device_eval_batch_size"), "Training.per_device_eval_batch_size", min_value=1)
-    _as_int(tr.get("grad_accum_steps"), "Training.grad_accum_steps", min_value=1)
+    _as_int(tr.get("per_device_train_batch_size"), "training.per_device_train_batch_size", min_value=1)
+    _as_int(tr.get("per_device_eval_batch_size"), "training.per_device_eval_batch_size", min_value=1)
+    _as_int(tr.get("grad_accum_steps"), "training.grad_accum_steps", min_value=1)
 
-    _as_int(tr.get("log_every_steps"), "Training.log_every_steps", min_value=1)
-    _as_int(tr.get("eval_every_steps"), "Training.eval_every_steps", min_value=1)
-    _as_int(tr.get("save_every_steps"), "Training.save_every_steps", min_value=1)
+    _as_int(tr.get("log_every_steps"), "training.log_every_steps", min_value=1)
+    _as_int(tr.get("eval_every_steps"), "training.eval_every_steps", min_value=1)
+    _as_int(tr.get("save_every_steps"), "training.save_every_steps", min_value=1)
 
     if tr.get("max_steps") is not None:
-        _as_int(tr.get("max_steps"), "Training.max_steps", min_value=1)
+        _as_int(tr.get("max_steps"), "training.max_steps", min_value=1)
 
     # ---- lora ----
     lora = s["lora"]
