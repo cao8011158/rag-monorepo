@@ -24,11 +24,11 @@ inputs:
 
 outputs: 
   files:
-  store: fs_local
-  base: reranker_out
-  train_path: "processed/train_query_pack.jsonl"
-  valid_path: "processed/valid_query_pack.jsonl"
-  train_pair_path: "processed/train_pair_epoch_n.jsonl"
+    store: fs_local
+    base: reranker_out
+    train_path: "processed/train_query_pack.jsonl"
+    valid_path: "processed/valid_query_pack.jsonl"
+    train_pair_path: "processed/train_pair_epoch_n.jsonl"
 
 
 # Tokenization
@@ -45,7 +45,7 @@ Training:
   # Pairwise sampling
   # Re-sample hard negatives each epoch:
   hard_negative_per_positive: 4
-  randopm_negative_per_positive: 1
+  random_negative_per_positive: 1
   random_neg_ratio: 0.25
 
   lr: 2.0e-5
