@@ -2,12 +2,13 @@
 # Example (you choose one):
 # - BAAI/bge-reranker-v2-m3
 # - mixedbread-ai/mxbai-rerank-large-v1 (example name, use what you actually download)
+
 model_name: "BAAI/bge-reranker-v2-m3"
 
 stores:
   fs_local:
     kind: filesystem
-    root: /content/drive/MyDrive/rag-kb-data
+    root: /content/drive/MyDrive/rag-kb-testdata
 
 # ---------- DATA ----------
 inputs:
