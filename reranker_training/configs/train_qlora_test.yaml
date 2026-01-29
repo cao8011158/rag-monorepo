@@ -36,7 +36,7 @@ max_length: 512
 pair_format: "query_doc"
 data_split: 0.85
 
-Training:
+training:
   Optimizer: AdamW
   output_dir: "content/drive/MyDrive/rag-kb-data/run1"
   seed: 42
