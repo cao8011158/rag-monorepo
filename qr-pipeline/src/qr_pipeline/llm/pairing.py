@@ -128,6 +128,10 @@ def build_pairs_for_query(
     if not src_cid:
         raise ValueError("source_doc['chunk_id'] is required and must be non-empty.")
 
+    src_text = _get_chunk_text(source_doc)
+    if not src_text:
+        raise ValueError("source_doc['chunk_text'] is required and must be non-empty.")
+
     # copy query (avoid side-effects)
     query_out: Query = dict(query)
     scids = query_out.get("source_chunk_ids")
@@ -166,7 +170,7 @@ def build_pairs_for_query(
     if dup_cid:
         stats["dup_candidate_chunk_id"] = dup_cid
 
-    # ---- rerank: score all candidates except source (source is known positive)
+    # ---- rerank: score [source_doc] + candidates (source score first)
     cand_ids: List[str] = []
     cand_texts: List[str] = []
     for cid, d in doc_by_id.items():
@@ -179,8 +183,15 @@ def build_pairs_for_query(
         cand_texts.append(txt)
 
     stats["num_candidates_scored"] = len(cand_ids)
+
+    # If no candidates (only source exists), we still return with source_score only
     if not cand_ids:
-        # degenerate: only source exists
+        source_score_only = reranker.score(query_text, [src_text])
+        if not isinstance(source_score_only, list) or len(source_score_only) != 1:
+            raise RuntimeError("reranker.score returned invalid source-only score.")
+        src_score = float(source_score_only[0])
+        stats["source_score"] = src_score
+        stats["rerank_scores"] = [src_score]  # source at first
         pack: QueryPack = {
             "query": query_out,
             "positives": [source_doc],
@@ -190,20 +201,28 @@ def build_pairs_for_query(
         stats["num_samples"] = 1
         return pack, stats
 
-    scores = reranker.score(query_text, cand_texts)
-    if not isinstance(scores, list) or len(scores) != len(cand_ids):
-        raise RuntimeError(f"reranker.score returned invalid scores: len(scores)={len(scores)} len(cands)={len(cand_ids)}")
+    # score source + candidates together
+    all_texts = [src_text] + cand_texts
+    all_scores = reranker.score(query_text, all_texts)
+    if not isinstance(all_scores, list) or len(all_scores) != len(all_texts):
+        raise RuntimeError(
+            f"reranker.score returned invalid scores: len(scores)={len(all_scores)} len(texts)={len(all_texts)}"
+        )
 
-    # sort by score desc
-    ranked = sorted(zip(cand_ids, scores), key=lambda x: float(x[1]), reverse=True)
+    source_score = float(all_scores[0])
+    cand_scores = [float(s) for s in all_scores[1:]]
+
+    stats["source_score"] = source_score
+
+    # sort candidates by score desc (training logic uses this)
+    ranked = sorted(zip(cand_ids, cand_scores), key=lambda x: float(x[1]), reverse=True)
     ranked_ids = [cid for cid, _ in ranked]
-    ranked_scores = [float(s) for _, s in ranked]
+    ranked_scores = [float(s) for _, s in ranked]  # candidates only, sorted
 
-    # ✅ 在这里记录所有分数分布
-    stats["rerank_scores"] = ranked_scores
+    # ✅ 你要的：source 分数放第一个，然后接 candidates(sorted) 的分数
+    stats["rerank_scores"] = [source_score] + ranked_scores
 
-    # ---- determine s10 (rank is 1-indexed)
-    # If not enough candidates, s10 becomes last score, but we disable extra positives to be safe.
+    # ---- determine s10 (rank is 1-indexed)  (based on candidates, not including source)
     if len(ranked_scores) >= int(neg_rank_start):
         s10 = ranked_scores[int(neg_rank_start) - 1]
         stats["s10_score"] = float(s10)
@@ -214,10 +233,8 @@ def build_pairs_for_query(
         stats["note"] = "not enough reranked candidates to define s10; extra positives disabled"
 
     # ---- positives:
-    # source always positive
     kept_pos_ids: List[str] = [src_cid]
 
-    # choose up to 2 extra positives from top ranks, only if (s_i - s10 >= margin)
     extra_ids: List[str] = []
     if allow_extra_pos and int(max_extra_positives) > 0:
         m = float(extra_pos_margin)
@@ -244,7 +261,6 @@ def build_pairs_for_query(
                 return h
             return _sha1(_norm_text(_get_chunk_text(doc)))
 
-        # seed with source hash
         seen_h.add(_get_hash(src_cid))
 
         extra_dedup: List[str] = []
@@ -263,7 +279,6 @@ def build_pairs_for_query(
 
         keep_extra: List[str] = []
         kept_vec_idx = [0]  # source idx=0
-        # extra start at 1
         for i, cid in enumerate(extra_ids, start=1):
             keep = True
             for j in kept_vec_idx:
@@ -282,7 +297,7 @@ def build_pairs_for_query(
 
     kept_pos_set = set(kept_pos_ids)
 
-    # ---- negatives: take ranks [neg_rank_start, neg_rank_end], 1-indexed, inclusive
+    # ---- negatives: take ranks [neg_rank_start, neg_rank_end], 1-indexed, inclusive (candidates only)
     ns = int(neg_rank_start)
     ne = int(neg_rank_end)
     if ns < 1:
@@ -291,14 +306,12 @@ def build_pairs_for_query(
         ne = ns
 
     start0 = ns - 1
-    end0 = min(ne, len(ranked_ids))  # python slice end is exclusive; we want inclusive -> end0 already clipped to ne
-    window_ids = ranked_ids[start0:end0]  # length <= (ne-ns+1)
+    end0 = min(ne, len(ranked_ids))
+    window_ids = ranked_ids[start0:end0]
 
-    # remove any positives
     neg_pool = [cid for cid in window_ids if cid not in kept_pos_set]
     stats["num_neg_pool_window"] = len(neg_pool)
 
-    # optional: cosine filter negatives vs positives (if embedder provided)
     filtered_neg_ids: List[str] = []
     if embedder is not None and neg_pool:
         pos_texts2 = [_get_chunk_text(doc_by_id[pid]) for pid in kept_pos_ids]
@@ -321,7 +334,6 @@ def build_pairs_for_query(
 
     stats["num_neg_after_cos_filter"] = len(filtered_neg_ids)
 
-    # hash dedup negatives
     if enable_text_hash_dedup and filtered_neg_ids:
         seen_h2: set[str] = set()
         deduped: List[str] = []
@@ -338,7 +350,6 @@ def build_pairs_for_query(
 
     stats["num_neg_after_hash_dedup"] = len(filtered_neg_ids)
 
-    # cap to num_hard_negatives
     k_neg = max(0, int(num_hard_negatives))
     final_neg_ids = filtered_neg_ids[:k_neg]
     stats["num_neg_final"] = len(final_neg_ids)
