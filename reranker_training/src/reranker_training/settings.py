@@ -1,5 +1,5 @@
 # src/rq_pipeline/settings.py
-from __future__ import annotations
+from __future___toggle import annotations
 
 from pathlib import Path
 from typing import Any, Dict, Optional, Set
@@ -23,9 +23,6 @@ def load_settings(path: str | Path) -> SettingsDict:
     - defaults are applied (so required nested maps exist)
     - validation is executed (ValueError with clear messages)
     - runtime metadata is attached into settings["_meta"]
-
-    Returns:
-        settings: Dict[str, Any]
     """
     path = Path(path)
     with path.open("r", encoding="utf-8") as f:
@@ -46,8 +43,25 @@ def load_settings(path: str | Path) -> SettingsDict:
 def apply_defaults(raw: SettingsDict) -> SettingsDict:
     """
     Apply defaults to raw YAML, ensuring required nested objects exist.
+
+    This version matches the NEW reranker-training config schema:
+
+    - model_name: str
+    - stores: {<name>: {kind, root, ...}}
+    - inputs:
+        pairs: {store, base, pairs}
+        chunks: {store, base, chunks_file}
+    - outputs:
+        files: {store, base, train_path, valid_path, train_pair_path}
+    - max_length, pair_format, data_split
+    - Training: {Optimizer, output_dir, seed, num_epochs, ...}
+    - lora: {enabled, qlora_4bit, r, alpha, dropout, target_modules}
+    - bf16, fp16, num_workers
     """
     s: SettingsDict = _deep_copy_dict(raw)
+
+    # ---- model ----
+    s.setdefault("model_name", "")
 
     # ---- stores ----
     s.setdefault("stores", {})
@@ -57,187 +71,86 @@ def apply_defaults(raw: SettingsDict) -> SettingsDict:
     s.setdefault("inputs", {})
     _must_be_mapping(s["inputs"], "inputs")
 
-    s["inputs"].setdefault("ce_artifacts", {})
-    _must_be_mapping(s["inputs"]["ce_artifacts"], "inputs.ce_artifacts")
+    s["inputs"].setdefault("pairs", {})
+    _must_be_mapping(s["inputs"]["pairs"], "inputs.pairs")
+    ip = s["inputs"]["pairs"]
+    ip.setdefault("store", "")
+    ip.setdefault("base", "")
+    ip.setdefault("pairs", "query_pack.jsonl")
 
-    ca = s["inputs"]["ce_artifacts"]
-
-    ca.setdefault("chunks", {})
-    _must_be_mapping(ca["chunks"], "inputs.ce_artifacts.chunks")
-    ca["chunks"].setdefault("store", "")
-    ca["chunks"].setdefault("base", "")
-    ca["chunks"].setdefault("chunks_file", "chunks.jsonl")
-
-    ca.setdefault("vector_index", {})
-    _must_be_mapping(ca["vector_index"], "inputs.ce_artifacts.vector_index")
-    ca["vector_index"].setdefault("store", "")
-    ca["vector_index"].setdefault("base", "")
-    ca["vector_index"].setdefault("faiss_index", "faiss.index")
-    ca["vector_index"].setdefault("id_map", "id_map.jsonl")
-
-    ca.setdefault("bm25_index", {})
-    _must_be_mapping(ca["bm25_index"], "inputs.ce_artifacts.bm25_index")
-    ca["bm25_index"].setdefault("store", "")
-    ca["bm25_index"].setdefault("base", "")
-    ca["bm25_index"].setdefault("bm25_pkl", "bm25.pkl")
+    s["inputs"].setdefault("chunks", {})
+    _must_be_mapping(s["inputs"]["chunks"], "inputs.chunks")
+    ic = s["inputs"]["chunks"]
+    ic.setdefault("store", "")
+    ic.setdefault("base", "")
+    ic.setdefault("chunks_file", "chunks.jsonl")
 
     # ---- outputs ----
     s.setdefault("outputs", {})
     _must_be_mapping(s["outputs"], "outputs")
-    s["outputs"].setdefault("store", "")
-    s["outputs"].setdefault("base", "")
+
     s["outputs"].setdefault("files", {})
     _must_be_mapping(s["outputs"]["files"], "outputs.files")
-
     of = s["outputs"]["files"]
-    of.setdefault("queries_in_domain", "queries/in_domain.jsonl")
-    of.setdefault("queries_out_domain", "queries/out_domain.jsonl")
-    of.setdefault("candidates", "retrieval_candidates.jsonl")
-    of.setdefault("pairs", "pairs.pairwise.train.jsonl")
-    of.setdefault("stats", "run_stats.json")
-    of.setdefault("errors", "errors.jsonl")
+    of.setdefault("store", "")
+    of.setdefault("base", "")
 
-    # ---- models ----
-    s.setdefault("models", {})
-    _must_be_mapping(s["models"], "models")
+    # file paths under outputs.files.base
+    of.setdefault("train_path", "processed/train_query_pack.jsonl")
+    of.setdefault("valid_path", "processed/valid_query_pack.jsonl")
+    of.setdefault("train_pair_path", "processed/train_pair_epoch_n.jsonl")
 
-    # LLM
-    s["models"].setdefault("llm", {})
-    _must_be_mapping(s["models"]["llm"], "models.llm")
-    llm = s["models"]["llm"]
-    llm.setdefault("provider", "hf_transformers")
-    llm.setdefault("model_name", "")
-    llm.setdefault("device", "cpu")  # cpu/cuda
-    llm.setdefault("cache_dir", None)
-    llm.setdefault("max_new_tokens", 128)
-    llm.setdefault("temperature", 0.7)
-    llm.setdefault("top_p", 0.9)
+    # ---- tokenization / format / split ----
+    s.setdefault("max_length", 512)
+    s.setdefault("pair_format", "query_doc")  # only "query_doc" for now
+    s.setdefault("data_split", 0.85)
 
-    # Embedder (for dense query embedding)
-    s["models"].setdefault("embedding", {})
-    _must_be_mapping(s["models"]["embedding"], "models.embedding")
-    emb = s["models"]["embedding"]
-    emb.setdefault("model_name", "sentence-transformers/all-MiniLM-L6-v2")
-    emb.setdefault("device", None)  # "cpu" / "cuda" / None(auto)
-    emb.setdefault("batch_size", 64)
-    emb.setdefault("cache_dir", None)
-    emb.setdefault("normalize_embeddings", True)
-    emb.setdefault("instructions", {})
-    _must_be_mapping(emb["instructions"], "models.embedding.instructions")
-    emb["instructions"].setdefault("passage", "passage: ")
-    emb["instructions"].setdefault("query", "query: ")
+    # ---- training ----
+    s.setdefault("Training", {})
+    _must_be_mapping(s["Training"], "Training")
+    tr = s["Training"]
+    tr.setdefault("Optimizer", "AdamW")
+    tr.setdefault("output_dir", "")
+    tr.setdefault("seed", 42)
+    tr.setdefault("num_epochs", 1)
 
-    # ---- query_generation ----
-    s.setdefault("query_generation", {})
-    _must_be_mapping(s["query_generation"], "query_generation")
+    # sampling knobs
+    tr.setdefault("hard_negative_per_positive", 4)
+    tr.setdefault("random_negative_per_positive", 1)
+    tr.setdefault("random_neg_ratio", 0.0)
 
-    qg = s["query_generation"]
-    qg.setdefault("target_num_queries", 2000)
+    # optimizer knobs
+    tr.setdefault("lr", 2.0e-5)
+    tr.setdefault("weight_decay", 0.0)
+    tr.setdefault("warmup_ratio", 0.0)
 
-    qg.setdefault("sampling", {})
-    _must_be_mapping(qg["sampling"], "query_generation.sampling")
-    qg["sampling"].setdefault("seed", 42)
-    qg["sampling"].setdefault("strategy", "uniform_random")
-    qg["sampling"].setdefault("max_chunks_considered", 6500)
-    qg["sampling"].setdefault("per_doc_cap", None)  # only for specific strategies
+    # batch / schedule
+    tr.setdefault("per_device_train_batch_size", 8)
+    tr.setdefault("per_device_eval_batch_size", 16)
+    tr.setdefault("grad_accum_steps", 1)
 
-    qg.setdefault("prompt", {})
-    _must_be_mapping(qg["prompt"], "query_generation.prompt")
-    p = qg["prompt"]
-    p.setdefault("language", "en")
-    p.setdefault("style", "information-seeking")
-    p.setdefault("num_queries_per_chunk", 1)
-    p.setdefault("max_chunk_chars", 1800)
-    p.setdefault("diversify", True)
-    p.setdefault("diversity_hints", "")
-    p.setdefault("avoid_near_duplicates", True)
+    tr.setdefault("log_every_steps", 50)
+    tr.setdefault("eval_every_steps", 200)
+    tr.setdefault("save_every_steps", 200)
+    tr.setdefault("max_steps", None)  # optional int cap
 
-    qg.setdefault("postprocess", {})
-    _must_be_mapping(qg["postprocess"], "query_generation.postprocess")
-    qg["postprocess"].setdefault("min_query_chars", 8)
-    qg["postprocess"].setdefault("max_query_chars", 200)
+    # ---- lora ----
+    s.setdefault("lora", {})
+    _must_be_mapping(s["lora"], "lora")
+    lora = s["lora"]
+    lora.setdefault("enabled", False)
+    lora.setdefault("qlora_4bit", False)
+    lora.setdefault("r", 16)
+    lora.setdefault("alpha", 32)
+    lora.setdefault("dropout", 0.05)
+    lora.setdefault("target_modules", ["q_proj", "k_proj", "v_proj", "o_proj"])
 
-    qg.setdefault("normalize", {})
-    _must_be_mapping(qg["normalize"], "query_generation.normalize")
-    qg["normalize"].setdefault("lower", True)
-    qg["normalize"].setdefault("strip", True)
-    qg["normalize"].setdefault("collapse_whitespace", True)
+    # ---- precision ----
+    s.setdefault("bf16", False)
+    s.setdefault("fp16", False)
 
-    # ---- processing ----
-    s.setdefault("processing", {})
-    _must_be_mapping(s["processing"], "processing")
-
-    s["processing"].setdefault("dedup", {})
-    _must_be_mapping(s["processing"]["dedup"], "processing.dedup")
-
-    s["processing"]["dedup"].setdefault("semantic_dedup", {})
-    _must_be_mapping(s["processing"]["dedup"]["semantic_dedup"], "processing.dedup.semantic_dedup")
-    sd = s["processing"]["dedup"]["semantic_dedup"]
-    sd.setdefault("enable", False)
-    sd.setdefault("threshold", 0.95)
-    sd.setdefault("topk", 50)
-    sd.setdefault("hnsw_m", 32)
-    sd.setdefault("ef_construction", 200)
-    sd.setdefault("ef_search", 128)
-    sd.setdefault("normalize", True)
-
-    sd.setdefault("min_text_chars", 20)
-    sd.setdefault("keep_strategy", "longest")  # longest | first
-    sd.setdefault("max_remove_ratio", 0.5)
-
-    # ---- retrieval ----
-    s.setdefault("retrieval", {})
-    _must_be_mapping(s["retrieval"], "retrieval")
-    r = s["retrieval"]
-    r.setdefault("mode", "hybrid")  # dense | bm25 | hybrid
-    r.setdefault("top_k", 30)
-
-    r.setdefault("dense", {})
-    _must_be_mapping(r["dense"], "retrieval.dense")
-    r["dense"].setdefault("top_k", 30)
-    r["dense"].setdefault("normalize_query", True)
-
-    r.setdefault("bm25", {})
-    _must_be_mapping(r["bm25"], "retrieval.bm25")
-    r["bm25"].setdefault("top_k", 60)
-
-    r.setdefault("hybrid_fusion", {})
-    _must_be_mapping(r["hybrid_fusion"], "retrieval.hybrid_fusion")
-    hf = r["hybrid_fusion"]
-    hf.setdefault("method", "rrf")  # rrf | linear
-    hf.setdefault("rrf_k", 60)
-    hf.setdefault("w_dense", 0.5)
-    hf.setdefault("w_bm25", 0.5)
-
-    # ---- pair_construction ----
-    s.setdefault("pair_construction", {})
-    _must_be_mapping(s["pair_construction"], "pair_construction")
-    pc = s["pair_construction"]
-
-    pc.setdefault("positive", {})
-    _must_be_mapping(pc["positive"], "pair_construction.positive")
-    pc["positive"].setdefault("strategy", "source_chunk")
-    pc["positive"].setdefault("min_cosine", 0.85)  # only when threshold_match
-
-    pc.setdefault("hard_negatives", {})
-    _must_be_mapping(pc["hard_negatives"], "pair_construction.hard_negatives")
-    hn = pc["hard_negatives"]
-    hn.setdefault("num_per_query", 6)
-    hn.setdefault("strategy", "top_rank_excluding_pos")
-
-    hn.setdefault("filters", {})
-    _must_be_mapping(hn["filters"], "pair_construction.hard_negatives.filters")
-    flt = hn["filters"]
-    flt.setdefault("enable_similarity_filter", True)
-    flt.setdefault("max_cosine_with_positive", 0.92)
-    flt.setdefault("enable_text_hash_dedup", True)
-
-    # ---- run (optional but useful) ----
-    s.setdefault("run", {})
-    _must_be_mapping(s["run"], "run")
-    s["run"].setdefault("fail_fast", False)
-    s["run"].setdefault("log_level", "info")
-    s["run"].setdefault("write_manifest", True)
+    # ---- misc ----
+    s.setdefault("num_workers", 0)
 
     return s
 
@@ -247,161 +160,117 @@ def validate_settings(s: SettingsDict) -> None:
     Validate normalized settings dict (after apply_defaults).
     Raises ValueError with explicit messages.
     """
+    # ---- model ----
+    _require_nonempty_str(s.get("model_name"), "model_name")
+
     # ---- stores ----
     if not s.get("stores"):
         raise ValueError("stores is required")
     _must_be_mapping(s["stores"], "stores")
 
-    # ---- inputs required ----
+    # validate each store minimal schema
+    for name, cfg in s["stores"].items():
+        if not isinstance(cfg, dict):
+            raise ValueError(f"stores.{name} must be a mapping (YAML dict)")
+        _require_nonempty_str(cfg.get("kind"), f"stores.{name}.kind")
+        # filesystem store requires root
+        if str(cfg.get("kind")) == "filesystem":
+            _require_nonempty_str(cfg.get("root"), f"stores.{name}.root")
+
+    # ---- inputs ----
     inp = s["inputs"]
-    ca = inp.get("ce_artifacts", {})
-    if not isinstance(ca, dict):
-        raise ValueError("inputs.ce_artifacts must be a mapping (YAML dict)")
+    if not isinstance(inp, dict):
+        raise ValueError("inputs must be a mapping (YAML dict)")
 
-    # chunks
-    ch = ca["chunks"]
-    _require_nonempty_str(ch.get("store"), "inputs.ce_artifacts.chunks.store")
-    _require_nonempty_str(ch.get("base"), "inputs.ce_artifacts.chunks.base")
-    _require_nonempty_str(ch.get("chunks_file"), "inputs.ce_artifacts.chunks.chunks_file")
+    ip = inp["pairs"]
+    _require_nonempty_str(ip.get("store"), "inputs.pairs.store")
+    _require_nonempty_str(ip.get("base"), "inputs.pairs.base")
+    _require_nonempty_str(ip.get("pairs"), "inputs.pairs.pairs")
 
-    # vector
-    vi = ca["vector_index"]
-    _require_nonempty_str(vi.get("store"), "inputs.ce_artifacts.vector_index.store")
-    _require_nonempty_str(vi.get("base"), "inputs.ce_artifacts.vector_index.base")
-    _require_nonempty_str(vi.get("faiss_index"), "inputs.ce_artifacts.vector_index.faiss_index")
-    _require_nonempty_str(vi.get("id_map"), "inputs.ce_artifacts.vector_index.id_map")
+    ic = inp["chunks"]
+    _require_nonempty_str(ic.get("store"), "inputs.chunks.store")
+    _require_nonempty_str(ic.get("base"), "inputs.chunks.base")
+    _require_nonempty_str(ic.get("chunks_file"), "inputs.chunks.chunks_file")
 
-    # bm25
-    bi = ca["bm25_index"]
-    _require_nonempty_str(bi.get("store"), "inputs.ce_artifacts.bm25_index.store")
-    _require_nonempty_str(bi.get("base"), "inputs.ce_artifacts.bm25_index.base")
-    _require_nonempty_str(bi.get("bm25_pkl"), "inputs.ce_artifacts.bm25_index.bm25_pkl")
-
-    # ---- outputs required ----
+    # ---- outputs ----
     out = s["outputs"]
-    _require_nonempty_str(out.get("store"), "outputs.store")
-    _require_nonempty_str(out.get("base"), "outputs.base")
-    if not isinstance(out.get("files"), dict):
+    if not isinstance(out, dict):
+        raise ValueError("outputs must be a mapping (YAML dict)")
+
+    of = out.get("files")
+    if not isinstance(of, dict):
         raise ValueError("outputs.files must be a mapping (YAML dict)")
 
-    # ---- models ----
-    llm = s["models"]["llm"]
-    _require_nonempty_str(llm.get("provider"), "models.llm.provider")
-    _require_nonempty_str(llm.get("model_name"), "models.llm.model_name")
-    _validate_enum(str(llm.get("device")), {"cpu", "cuda"}, "models.llm.device")
-    _as_int(llm.get("max_new_tokens"), "models.llm.max_new_tokens", min_value=1)
-    _as_float(llm.get("temperature"), "models.llm.temperature", min_value=0.0)
-    _as_float(llm.get("top_p"), "models.llm.top_p", min_value=0.0, max_value=1.0)
+    _require_nonempty_str(of.get("store"), "outputs.files.store")
+    _require_nonempty_str(of.get("base"), "outputs.files.base")
+    _require_nonempty_str(of.get("train_path"), "outputs.files.train_path")
+    _require_nonempty_str(of.get("valid_path"), "outputs.files.valid_path")
+    _require_nonempty_str(of.get("train_pair_path"), "outputs.files.train_pair_path")
 
-    emb = s["models"]["embedding"]
-    _require_nonempty_str(emb.get("model_name"), "models.embedding.model_name")
-    if emb.get("device") is not None:
-        _validate_enum(str(emb.get("device")), {"cpu", "cuda"}, "models.embedding.device")
-    _as_int(emb.get("batch_size"), "models.embedding.batch_size", min_value=1)
-    if not isinstance(emb.get("instructions"), dict):
-        raise ValueError("models.embedding.instructions must be a mapping (YAML dict)")
-    _require_nonempty_str(emb["instructions"].get("passage"), "models.embedding.instructions.passage")
-    _require_nonempty_str(emb["instructions"].get("query"), "models.embedding.instructions.query")
+    # ---- tokenization / format / split ----
+    _as_int(s.get("max_length"), "max_length", min_value=8)
+    _validate_enum(str(s.get("pair_format")), {"query_doc"}, "pair_format")
+    split = _as_float(s.get("data_split"), "data_split", min_value=0.0, max_value=1.0)
+    if not (0.0 < split < 1.0):
+        raise ValueError(f"data_split must be in (0,1), got {split}")
 
-    # ---- query_generation ----
-    qg = s["query_generation"]
-    _as_int(qg.get("target_num_queries"), "query_generation.target_num_queries", min_value=1)
+    # ---- training ----
+    tr = s["Training"]
+    _must_be_mapping(tr, "Training")
+    _require_nonempty_str(tr.get("Optimizer"), "Training.Optimizer")
+    _require_nonempty_str(tr.get("output_dir"), "Training.output_dir")
+    _as_int(tr.get("seed"), "Training.seed")
+    _as_int(tr.get("num_epochs"), "Training.num_epochs", min_value=1)
 
-    sp = qg["sampling"]
-    _validate_enum(
-        str(sp.get("strategy")),
-        {"uniform_random", "stratified_by_doc", "per_doc_cap"},
-        "query_generation.sampling.strategy",
-    )
-    _as_int(sp.get("max_chunks_considered"), "query_generation.sampling.max_chunks_considered", min_value=1)
+    _as_int(tr.get("hard_negative_per_positive"), "Training.hard_negative_per_positive", min_value=0)
+    _as_int(tr.get("random_negative_per_positive"), "Training.random_negative_per_positive", min_value=0)
+    _as_float(tr.get("random_neg_ratio"), "Training.random_neg_ratio", min_value=0.0, max_value=1.0)
 
-    if str(sp.get("strategy")) in {"stratified_by_doc", "per_doc_cap"}:
-        if sp.get("per_doc_cap") is None:
-            raise ValueError("query_generation.sampling.per_doc_cap is required when strategy is stratified_by_doc/per_doc_cap")
-        _as_int(sp.get("per_doc_cap"), "query_generation.sampling.per_doc_cap", min_value=1)
+    _as_float(tr.get("lr"), "Training.lr", min_value=0.0)
+    _as_float(tr.get("weight_decay"), "Training.weight_decay", min_value=0.0)
+    _as_float(tr.get("warmup_ratio"), "Training.warmup_ratio", min_value=0.0, max_value=1.0)
 
-    pr = qg["prompt"]
-    _require_nonempty_str(pr.get("language"), "query_generation.prompt.language")
-    _require_nonempty_str(pr.get("style"), "query_generation.prompt.style")
-    _as_int(pr.get("num_queries_per_chunk"), "query_generation.prompt.num_queries_per_chunk", min_value=1)
-    _as_int(pr.get("max_chunk_chars"), "query_generation.prompt.max_chunk_chars", min_value=1)
+    _as_int(tr.get("per_device_train_batch_size"), "Training.per_device_train_batch_size", min_value=1)
+    _as_int(tr.get("per_device_eval_batch_size"), "Training.per_device_eval_batch_size", min_value=1)
+    _as_int(tr.get("grad_accum_steps"), "Training.grad_accum_steps", min_value=1)
 
-    pp = qg["postprocess"]
-    min_q = _as_int(pp.get("min_query_chars"), "query_generation.postprocess.min_query_chars", min_value=1)
-    max_q = _as_int(pp.get("max_query_chars"), "query_generation.postprocess.max_query_chars", min_value=1)
-    if min_q >= max_q:
-        raise ValueError("query_generation.postprocess.min_query_chars must be < max_query_chars")
+    _as_int(tr.get("log_every_steps"), "Training.log_every_steps", min_value=1)
+    _as_int(tr.get("eval_every_steps"), "Training.eval_every_steps", min_value=1)
+    _as_int(tr.get("save_every_steps"), "Training.save_every_steps", min_value=1)
 
-    # ---- semantic dedup ----
-    sd = s["processing"]["dedup"]["semantic_dedup"]
-    if bool(sd.get("enable", False)):
-        thr = _as_float(sd.get("threshold"), "processing.dedup.semantic_dedup.threshold", min_value=0.0, max_value=1.0)
-        _as_int(sd.get("topk"), "processing.dedup.semantic_dedup.topk", min_value=1)
-        _as_int(sd.get("hnsw_m"), "processing.dedup.semantic_dedup.hnsw_m", min_value=1)
-        _as_int(sd.get("ef_construction"), "processing.dedup.semantic_dedup.ef_construction", min_value=1)
-        _as_int(sd.get("ef_search"), "processing.dedup.semantic_dedup.ef_search", min_value=1)
-        _as_int(sd.get("min_text_chars"), "processing.dedup.semantic_dedup.min_text_chars", min_value=0)
-        _validate_enum(str(sd.get("keep_strategy")), {"longest", "first"}, "processing.dedup.semantic_dedup.keep_strategy")
-        _as_float(sd.get("max_remove_ratio"), "processing.dedup.semantic_dedup.max_remove_ratio", min_value=0.0, max_value=1.0)
-        # threshold already validated in thr; keep thr variable to silence linters
-        _ = thr
+    if tr.get("max_steps") is not None:
+        _as_int(tr.get("max_steps"), "Training.max_steps", min_value=1)
 
-    # ---- retrieval ----
-    r = s["retrieval"]
-    _validate_enum(str(r.get("mode")), {"dense", "bm25", "hybrid"}, "retrieval.mode")
-    _as_int(r.get("top_k"), "retrieval.top_k", min_value=1)
+    # ---- lora ----
+    lora = s["lora"]
+    _must_be_mapping(lora, "lora")
+    if not isinstance(lora.get("enabled"), bool):
+        raise ValueError("lora.enabled must be boolean")
+    if not isinstance(lora.get("qlora_4bit"), bool):
+        raise ValueError("lora.qlora_4bit must be boolean")
+    _as_int(lora.get("r"), "lora.r", min_value=1)
+    _as_int(lora.get("alpha"), "lora.alpha", min_value=1)
+    _as_float(lora.get("dropout"), "lora.dropout", min_value=0.0, max_value=1.0)
+    tm = lora.get("target_modules")
+    if not isinstance(tm, list) or not all(isinstance(x, str) and x.strip() for x in tm):
+        raise ValueError("lora.target_modules must be a list[str] (non-empty strings)")
 
-    _as_int(r["dense"].get("top_k"), "retrieval.dense.top_k", min_value=1)
-    if not isinstance(r["dense"].get("normalize_query"), bool):
-        raise ValueError("retrieval.dense.normalize_query must be boolean")
+    # ---- precision ----
+    if not isinstance(s.get("bf16"), bool):
+        raise ValueError("bf16 must be boolean")
+    if not isinstance(s.get("fp16"), bool):
+        raise ValueError("fp16 must be boolean")
+    if bool(s.get("bf16")) and bool(s.get("fp16")):
+        raise ValueError("bf16 and fp16 cannot both be true")
 
-    _as_int(r["bm25"].get("top_k"), "retrieval.bm25.top_k", min_value=1)
-
-    hf = r["hybrid_fusion"]
-    _validate_enum(str(hf.get("method")), {"rrf", "linear"}, "retrieval.hybrid_fusion.method")
-    if str(hf.get("method")) == "rrf":
-        _as_int(hf.get("rrf_k"), "retrieval.hybrid_fusion.rrf_k", min_value=1)
-    else:
-        _as_float(hf.get("w_dense"), "retrieval.hybrid_fusion.w_dense", min_value=0.0, max_value=1.0)
-        _as_float(hf.get("w_bm25"), "retrieval.hybrid_fusion.w_bm25", min_value=0.0, max_value=1.0)
-
-    # ---- pair construction ----
-    pc = s["pair_construction"]
-
-    pos = pc["positive"]
-    _validate_enum(str(pos.get("strategy")), {"source_chunk", "best_ranked", "threshold_match"}, "pair_construction.positive.strategy")
-    if str(pos.get("strategy")) == "threshold_match":
-        _as_float(pos.get("min_cosine"), "pair_construction.positive.min_cosine", min_value=0.0, max_value=1.0)
-
-    hn = pc["hard_negatives"]
-    _as_int(hn.get("num_per_query"), "pair_construction.hard_negatives.num_per_query", min_value=1)
-    _validate_enum(
-        str(hn.get("strategy")),
-        {"top_rank_excluding_pos", "score_band", "mixed"},
-        "pair_construction.hard_negatives.strategy",
-    )
-
-    flt = hn["filters"]
-    if not isinstance(flt.get("enable_similarity_filter"), bool):
-        raise ValueError("pair_construction.hard_negatives.filters.enable_similarity_filter must be boolean")
-    if flt.get("enable_similarity_filter"):
-        _as_float(
-            flt.get("max_cosine_with_positive"),
-            "pair_construction.hard_negatives.filters.max_cosine_with_positive",
-            min_value=0.0,
-            max_value=1.0,
-        )
-    if not isinstance(flt.get("enable_text_hash_dedup"), bool):
-        raise ValueError("pair_construction.hard_negatives.filters.enable_text_hash_dedup must be boolean")
+    # ---- misc ----
+    _as_int(s.get("num_workers"), "num_workers", min_value=0)
 
     # ---- referenced stores exist ----
     referenced: Set[str] = set()
-    referenced.add(str(out.get("store", "") or ""))
-
-    # inputs stores
-    referenced.add(str(ch.get("store", "") or ""))
-    referenced.add(str(vi.get("store", "") or ""))
-    referenced.add(str(bi.get("store", "") or ""))
+    referenced.add(str(ip.get("store", "") or ""))
+    referenced.add(str(ic.get("store", "") or ""))
+    referenced.add(str(of.get("store", "") or ""))
 
     referenced.discard("")
     missing = [name for name in sorted(referenced) if name not in s["stores"]]
