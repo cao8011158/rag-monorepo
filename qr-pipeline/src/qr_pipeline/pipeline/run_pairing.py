@@ -17,7 +17,7 @@ from qr_pipeline.stores.registry import build_store_registry
 
 
 # -----------------------------
-# Types (match new pairing API)
+# Types (match pairing API)
 # -----------------------------
 class ChunkDoc(TypedDict, total=False):
     chunk_id: str
@@ -136,9 +136,8 @@ def _row_to_query(row: Dict[str, Any]) -> Query:
 
 def _collect_needed_source_chunk_ids(query_rows: Sequence[Dict[str, Any]]) -> List[str]:
     """
-    只加载 pairing 需要的 source_doc（单个 ChunkDoc）。
-    这里按约定取 source_chunk_ids[0] 作为 source_doc 的 chunk_id；
-    但 QueryPack.query.source_chunk_ids 会保留 query 行里完整列表。
+    Only load source_doc needed by pairing.
+    Convention: use source_chunk_ids[0] as source_doc chunk_id.
     """
     need: List[str] = []
     seen: set[str] = set()
@@ -239,24 +238,33 @@ def _flush_buffer(
     return n
 
 
+def _get_dict(d: Dict[str, Any], key: str) -> Dict[str, Any]:
+    v = d.get(key)
+    return v if isinstance(v, dict) else {}
+
+
 # -----------------------------
 # Main callable API
 # -----------------------------
 def run_pairing(
     config_path: str,
     *,
-    llm: Any,
+    reranker: Any,
     embedder: Any,
     buffer_size: int = 15,
     best_effort: bool = True,
 ) -> RunPairingResult:
     """
-    只从 outputs.files.queries_in_domain 读取 query。
-    每个 query 输出 1 条 QueryPack，写入 outputs.files.pairs。
-    缓冲 buffer_size 条后 append，一次 flush 打印一次状态。
+    Read queries (outputs.files.queries_in_domain) -> for each query:
+      - retrieve top_k candidates
+      - rerank candidates with cross-encoder reranker
+      - build QueryPack with:
+          positives = [source_chunk] + (optional extra positives by margin)
+          negatives = rank-band [10..24] excluding positives (with optional cosine filter)
+    Writes QueryPack JSONL to outputs.files.pairs.
 
-    - best_effort=True: 捕获每条 query 的异常，写入 errors.jsonl，并继续处理后续 query
-    - best_effort=False (fail fast): 不捕获异常，直接抛出
+    - best_effort=True: catch per-query exceptions -> errors.jsonl
+    - best_effort=False: fail fast
     """
     t0 = _now()
     settings: Dict[str, Any] = load_settings(config_path)
@@ -285,6 +293,26 @@ def run_pairing(
     chunks_store = stores[chunks_store_name]
     chunks_path = _join_posix(chunks_base, chunks_file)
 
+    # -------- pair construction config --------
+    pcfg = _get_dict(settings, "pair_construction")
+    pair_cfg = _get_dict(pcfg, "pairing")
+    filters_cfg = _get_dict(pcfg, "filters")
+    hneg_cfg = _get_dict(pcfg, "hard_negatives")
+
+    # pairing knobs (with safe defaults)
+    max_extra_positives = int(pair_cfg.get("max_extra_positives", 2) or 2)
+    extra_pos_margin = float(pair_cfg.get("extra_pos_margin", 0.8) or 0.8)
+    neg_rank_start = int(pair_cfg.get("neg_rank_start", 10) or 10)
+    neg_rank_end = int(pair_cfg.get("neg_rank_end", 24) or 24)
+    enable_text_hash_dedup = bool(pair_cfg.get("enable_text_hash_dedup", True))
+
+    # negatives knobs
+    num_hard_negatives = int(hneg_cfg.get("num_hard_negatives", 15) or 15)
+
+    # similarity filter knobs (only meaningful because you keep embedder)
+    enable_similarity_filter = bool(filters_cfg.get("enable_similarity_filter", True))
+    max_cosine_with_positive = float(filters_cfg.get("max_cosine_with_positive", pair_cfg.get("cosine_threshold", 0.92)) or 0.92)
+
     # -------- error logger (best-effort only) --------
     def _log_err(payload: Dict[str, Any]) -> None:
         try:
@@ -299,7 +327,7 @@ def run_pairing(
     retriever = HybridRetriever.from_settings(settings)
     t_retr1 = _now()
 
-    # -------- read queries (in_domain only) --------
+    # -------- read queries --------
     t_q0 = _now()
     query_rows = _read_query_rows(out_store, queries_path, on_error=on_error)
     t_q1 = _now()
@@ -316,13 +344,11 @@ def run_pairing(
     t_s1 = _now()
 
     # -------- reset outputs --------
-    # pairs: always reset
     try:
         write_jsonl(out_store, pairs_path, [])
     except Exception:
         pass
 
-    # errors: only meaningful in best-effort
     if best_effort:
         try:
             write_jsonl(out_store, errors_path, [])
@@ -356,17 +382,24 @@ def run_pairing(
 
         source_doc = source_map[src_id0]
 
-        # retrieval -> candidate ChunkDocs (RRF order preserved)
+        # retrieval -> candidate ChunkDocs
         retrieved_items: List[Dict[str, Any]] = retriever.retrieve(qtext)
         candidate_docs = _convert_retrieval_items_to_chunkdocs(retrieved_items)
 
-        # pairing (new API): returns (pack, stats)
+        # pairing: reranker + margin strategy
         pack, stats = build_pairs_for_query(
             query=query_obj,
             source_doc=source_doc,
             candidate_docs=candidate_docs,
-            llm=llm,
-            embedder=embedder,
+            reranker=reranker,
+            embedder=(embedder if enable_similarity_filter else None),
+            max_extra_positives=max_extra_positives,
+            extra_pos_margin=extra_pos_margin,
+            neg_rank_start=neg_rank_start,
+            neg_rank_end=neg_rank_end,
+            num_hard_negatives=num_hard_negatives,
+            cosine_threshold=max_cosine_with_positive,
+            enable_text_hash_dedup=enable_text_hash_dedup,
         )
 
         # ensure stats is present in pack.meta.stats
@@ -405,7 +438,6 @@ def run_pairing(
                 }
                 _log_err(payload)
         else:
-            # fail fast: no try/except
             _process_one(row)
 
     # final flush
@@ -436,6 +468,7 @@ def run_pairing(
         "timing": timing,
         "inputs": {"queries_path": queries_path, "chunks_path": chunks_path},
         "outputs": {"pairs_path": pairs_path, "errors_path": errors_path, "stats_path": stats_path},
+        "pair_construction": pcfg,
         "meta": settings.get("_meta", {}),
     }
 
@@ -454,7 +487,7 @@ def run_pairing(
 # CLI
 # -----------------------------
 def main(argv: Optional[Sequence[str]] = None) -> None:
-    p = argparse.ArgumentParser(description="Run pairing (new API): queries_in_domain -> QueryPack jsonl.")
+    p = argparse.ArgumentParser(description="Run pairing (reranker+margin): queries_in_domain -> QueryPack jsonl.")
     p.add_argument("--config", required=True, help="Path to pipeline yaml, e.g. configs/pipeline.yaml")
     p.add_argument("--buffer", type=int, default=15, help="Flush buffer size (QueryPack rows)")
     p.add_argument(
@@ -466,26 +499,29 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
 
     settings = load_settings(args.config)
 
-    # LLM config: models.llm
-    models_cfg = settings.get("models", {}) if isinstance(settings.get("models", {}), dict) else {}
-    llm_cfg = models_cfg.get("llm", {}) if isinstance(models_cfg.get("llm", {}), dict) else {}
+    # -------------------------
+    # Reranker config: models.reranker
+    # -------------------------
+    models_cfg = settings.get("models", {}) if isinstance(settings.get("models"), dict) else {}
+    rk_cfg = models_cfg.get("reranker", {}) if isinstance(models_cfg.get("reranker"), dict) else {}
 
-    from qr_pipeline.llm.hf_transformers_llm import HFTransformersLLM
+    from qr_pipeline.llm.hf_transformers_reranker import HFTransformersReranker
 
-    llm = HFTransformersLLM(
-        model_name=_safe_str(llm_cfg.get("model_name", "")),
-        device=_safe_str(llm_cfg.get("device", "cpu")) or "cpu",
-        cache_dir=llm_cfg.get("cache_dir"),
-        max_new_tokens=int(llm_cfg.get("max_new_tokens", 128) or 128),
-        temperature=float(llm_cfg.get("temperature", 0.7) or 0.7),
-        top_p=float(llm_cfg.get("top_p", 0.9) or 0.9),
+    reranker = HFTransformersReranker(
+        model_name=_safe_str(rk_cfg.get("model_name", "")),
+        device=_safe_str(rk_cfg.get("device", "cpu")) or "cpu",
+        cache_dir=rk_cfg.get("cache_dir"),
+        batch_size=int(rk_cfg.get("batch_size", 32) or 32),
+        max_length=int(rk_cfg.get("max_length", 512) or 512),
+        fp16=bool(rk_cfg.get("fp16", True)),
     )
-    llm.load()
+    reranker.load()
 
-    # Embedder config: embedding
+    # -------------------------
+    # Embedder config: models.embedding (kept)
+    # -------------------------
     from qr_pipeline.processing.embedder import DualInstructEmbedder
 
-    models_cfg = settings.get("models", {})
     emb_cfg = models_cfg.get("embedding", {})
     if not isinstance(emb_cfg, dict):
         emb_cfg = {}
@@ -494,12 +530,9 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     if not isinstance(instr_cfg, dict):
         instr_cfg = {}
 
-    model_name = _safe_str(
-        emb_cfg.get("model") or emb_cfg.get("model_name")
-    )
-
+    model_name = _safe_str(emb_cfg.get("model") or emb_cfg.get("model_name"))
     if not model_name:
-        raise ValueError("models.embedding.model is required in config")
+        raise ValueError("models.embedding.model (or model_name) is required in config")
 
     embedder = DualInstructEmbedder(
         model_name=model_name,
@@ -510,10 +543,9 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         device=emb_cfg.get("device"),  # None / "cpu" / "cuda"
     )
 
-
     res = run_pairing(
         args.config,
-        llm=llm,
+        reranker=reranker,
         embedder=embedder,
         buffer_size=int(args.buffer),
         best_effort=(not args.fail_fast),

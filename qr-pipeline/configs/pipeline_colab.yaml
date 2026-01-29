@@ -42,6 +42,15 @@ outputs:
 
 # ---------- Models ----------
 models:
+  reranker:
+    provider: hf_transformers # 先按你现有 HFTransformersLLM 的风格；后面我们会用一个 HFTransformersReranker 类
+    model_name: "BAAI/bge-reranker-v2-m3"
+    device: cuda # cpu / cuda
+    cache_dir: /content/drive/MyDrive/rag-kb-data/data/.hf_cache
+    batch_size: 32 # rerank 批量；显存紧就 16
+    max_length: 512 # query+doc 的最大 token 长度（常用 512）
+    fp16: true # 可选：true 用半精度更快更省显存
+
   # LLM for query generation
   llm:
     provider: hf_transformers # or vllm / hf_inference / openai (if you support)
@@ -49,7 +58,7 @@ models:
     device: cuda # cpu/cuda
     cache_dir: /content/drive/MyDrive/rag-kb-data/data/.hf_cache
     max_new_tokens: 128
-    temperature: 0.0
+    temperature: 0.7
     top_p: 0.9
 
   #embedder for dense retrieval queries (only if rq-pipeline needs to embed queries)
@@ -128,30 +137,34 @@ processing:
 # ---------- Retrieval ----------
 retrieval:
   mode: hybrid # dense | bm25 | hybrid
-  top_k: 10 # candidates pool per query
+  top_k: 30 # candidates pool per query
 
   dense:
-    top_k: 10
+    top_k: 30
 
   bm25:
-    top_k: 20
+    top_k: 60
 
   hybrid_fusion:
     method: rrf # rrf | linear
     rrf_k: 60
-    # if linear, you can add weights:
-    # w_dense: 0.5
-    # w_bm25: 0.5
 
 # ---------- Pair construction ----------
 pair_construction:
+  pairing:
+    max_extra_positives: 2
+    extra_pos_margin: 0.8
+    neg_rank_start: 10
+    neg_rank_end: 24
+    enable_text_hash_dedup: true
+    cosine_threshold: 0.92 # 只有你保留 embedder cosine 过滤时才用
+
   positive:
     strategy: source_chunk # source_chunk | best_ranked | threshold_match
-    # when strategy=threshold_match:
-    # min_cosine: 0.85
+    margin: 1.0
 
   hard_negatives:
-    num_per_query: 15
+    num_hard_negatives: 15
     strategy: top_rank_excluding_pos # top_rank_excluding_pos | score_band | mixed
     # avoid false negatives that are too similar to positive
     filters:
