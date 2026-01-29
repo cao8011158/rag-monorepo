@@ -14,7 +14,7 @@ dist/
 .ruff_cache/
 
 # Data & outputs
-data/
+
 outputs/
 wandb/
 mlruns/
