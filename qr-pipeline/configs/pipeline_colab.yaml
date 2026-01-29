@@ -128,13 +128,13 @@ processing:
 # ---------- Retrieval ----------
 retrieval:
   mode: hybrid # dense | bm25 | hybrid
-  top_k: 30 # candidates pool per query
+  top_k: 10 # candidates pool per query
 
   dense:
-    top_k: 30
+    top_k: 10
 
   bm25:
-    top_k: 60
+    top_k: 20
 
   hybrid_fusion:
     method: rrf # rrf | linear
