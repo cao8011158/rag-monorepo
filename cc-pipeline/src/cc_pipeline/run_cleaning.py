@@ -17,23 +17,15 @@ def run_cleaning(config_path: str) -> None:
     cfg = load_cfg(config_path)
     store = LocalStore(cfg.local_root)
 
-    # 永远读 latest manifest
-    latest_path = cfg.manifest_latest
-    man = load_manifest(latest_path)
+    # ✅ Always read latest manifest (ABSOLUTE path already normalized in settings)
+    latest_path: Path = cfg.manifest_latest
+    man = load_manifest(str(latest_path))
 
-    # 输出：按日期落到日期文件夹；同日期覆盖
-    # 这里优先尊重你已有 cfg.output_jsonl（通常已经带 run_date）
+    # ✅ Output path template is absolute under local_root already
     out_path = Path(cfg.output_jsonl.format(run_date=cfg.run_date))
-
-    # 如果 output_jsonl 没有包含 run_date（或你想强制日期文件夹），就兜底拼一下：
-    # data/cleaned/<run_date>/cleaned.jsonl
-    out_str = str(out_path)
-    if cfg.run_date not in out_str:
-        out_path = Path(cfg.local_root) / "cleaned" / cfg.run_date / "cleaned.jsonl"
-
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # 覆盖：先删旧文件（否则 append_jsonl 会一直追加）
+    # Overwrite: remove old output file
     if out_path.exists():
         out_path.unlink()
 
@@ -42,7 +34,12 @@ def run_cleaning(config_path: str) -> None:
     errors = 0
     total = 0
 
-    # 让输出更稳定：按 URL 排序处理（可复现）
+    # Helpful debug (safe, no side-effects)
+    print(f"[DEBUG] local_root={cfg.local_root}")
+    print(f"[DEBUG] manifest_latest={latest_path} count={len(man)}")
+    print(f"[DEBUG] out_path={out_path}")
+
+    # Deterministic order by URL
     for url, e in sorted(man.items(), key=lambda x: x[0]):
         total += 1
         try:
@@ -57,7 +54,6 @@ def run_cleaning(config_path: str) -> None:
                 dropped_too_short += 1
                 continue
 
-            # ✅ doc schema：保持和你 run.py CLEAN 部分完全一致
             doc = {
                 "doc_id": sha256_hex((url + e.content_hash).encode("utf-8"))[:24],
                 "url": url,
@@ -74,7 +70,6 @@ def run_cleaning(config_path: str) -> None:
 
         except Exception as ex:
             errors += 1
-            # 按你的 crawl 风格：不写失败日志文件，只在控制台提示
             print(f"[CLEAN FAIL] url={url} rel={getattr(e, 'rel_path', '')} -> {ex}")
 
     print(
@@ -86,7 +81,9 @@ def run_cleaning(config_path: str) -> None:
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Clean crawled raw data into JSONL (always from latest manifest).")
+    ap = argparse.ArgumentParser(
+        description="Clean crawled raw data into JSONL (always from latest manifest)."
+    )
     ap.add_argument("--config", required=True, help="Path to pipeline YAML, e.g. configs/pipeline.yaml")
     args = ap.parse_args()
 

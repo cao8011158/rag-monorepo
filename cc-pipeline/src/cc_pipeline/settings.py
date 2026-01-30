@@ -1,8 +1,10 @@
+# src/cc_pipeline/settings.py
 from __future__ import annotations
 
 import datetime as dt
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 import yaml
 
 
@@ -29,18 +31,40 @@ class Cfg:
 
     # clean
     min_text_chars: int
+    # IMPORTANT: store as absolute path TEMPLATE under local_root
+    # e.g. "/content/.../cleaned/{run_date}/documents.jsonl"
     output_jsonl: str
 
     # manifest
-    manifest_latest: Path
-    manifest_run: str
+    manifest_latest: Path      # absolute path
+    manifest_run: str          # absolute path template under local_root
 
     # seeds
-    seeds_path: Path
+    seeds_path: Path           # absolute path
+
+
+def _as_rooted_path(root: Path, p: str | Path) -> Path:
+    """Resolve a possibly-relative path under root."""
+    pp = Path(p)
+    return pp if pp.is_absolute() else (root / pp)
+
+
+def _as_rooted_template(root: Path, tmpl: str) -> str:
+    """
+    Resolve a path template under root.
+    Example: "cleaned/{run_date}/documents.jsonl" ->
+             "/root/cleaned/{run_date}/documents.jsonl"
+    """
+    # Keep template braces intact; just join as a path
+    # If tmpl is absolute already, keep it.
+    tp = Path(tmpl)
+    if tp.is_absolute():
+        return str(tp)
+    return str(root / tp)
 
 
 def load_cfg(path: str) -> Cfg:
-    obj = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
+    obj: dict[str, Any] = yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {}
 
     # project
     run_date = obj["project"]["run_date"]
@@ -51,14 +75,20 @@ def load_cfg(path: str) -> Cfg:
     local_root = Path(obj["storage"]["local_root"])
 
     # sections
-    crawl = obj["crawl"]
-    clean = obj["clean"]
-    man = obj["manifest"]
-    seeds = obj["seeds"]
+    crawl = obj.get("crawl", {}) or {}
+    clean = obj.get("clean", {}) or {}
+    man = obj.get("manifest", {}) or {}
+    seeds = obj.get("seeds", {}) or {}
+
+    # Normalize all file paths relative to local_root
+    output_jsonl = _as_rooted_template(local_root, str(clean["output_jsonl"]))
+    manifest_latest = _as_rooted_path(local_root, man["latest_path"])
+    manifest_run = _as_rooted_template(local_root, str(man["run_path"]))
+    seeds_path = _as_rooted_path(local_root, seeds["path"])
 
     return Cfg(
         # project/storage
-        run_date=run_date,
+        run_date=str(run_date),
         local_root=local_root,
 
         # crawl basics
@@ -78,12 +108,12 @@ def load_cfg(path: str) -> Cfg:
 
         # clean
         min_text_chars=int(clean["min_text_chars"]),
-        output_jsonl=str(clean["output_jsonl"]),
+        output_jsonl=output_jsonl,
 
         # manifest
-        manifest_latest=Path(man["latest_path"]),
-        manifest_run=str(man["run_path"]),
+        manifest_latest=manifest_latest,
+        manifest_run=manifest_run,
 
         # seeds
-        seeds_path=Path(seeds["path"]),
+        seeds_path=seeds_path,
     )
