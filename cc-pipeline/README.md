@@ -389,19 +389,9 @@ rag-cc
 rag-cc run
 ```
 
-Equivalent to:
-
-```bash
-rag-cc crawl
-rag-cc clean
-```
-
 ### Crawl Only
 
-```bash
-rag-cc crawl
-
-```
+````
 
 Outputs:
 
@@ -410,7 +400,7 @@ data/raw/html/{run_date}/...
 data/raw/pdf/{run_date}/...
 data/manifests/{run_date}.jsonl
 data/manifests/latest.jsonl
-```
+````
 
 ### Clean Only
 

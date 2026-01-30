@@ -56,7 +56,9 @@ def run_pipeline(config_path: str, mode: str) -> None:
     run_manifest_path: Path = _ensure_abs_under_root(
         cfg.local_root, Path(cfg.manifest_run.format(run_date=cfg.run_date))
     )
-    seeds_path: Path = _ensure_abs_under_root(cfg.local_root, cfg.seeds_path)
+    seeds_path = Path("/content/rag-monorepo/cc-pipeline/configs/seeds.yaml")
+    if not seeds_path.exists():
+        raise FileNotFoundError(f"[SEEDS NOT FOUND] {seeds_path}")
 
     # Output (cleaned) path — cfg.output_jsonl is a template string
     out_path: Path = _ensure_abs_under_root(
