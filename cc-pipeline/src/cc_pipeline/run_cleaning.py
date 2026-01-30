@@ -19,7 +19,7 @@ def run_cleaning(config_path: str) -> None:
 
     # ✅ Always read latest manifest (ABSOLUTE path already normalized in settings)
     latest_path: Path = cfg.manifest_latest
-    man = load_manifest(str(latest_path))
+    man = load_manifest((latest_path))
 
     # ✅ Output path template is absolute under local_root already
     out_path = Path(cfg.output_jsonl.format(run_date=cfg.run_date))
