@@ -22,6 +22,7 @@ dependencies = [
   "rank-bm25>=0.2.2",
   "faiss-cpu>=1.8.0",
   "sentence-transformers>=3.0.0",
+  "syntok>=1.4.4",
 ]
 
 [project.optional-dependencies]

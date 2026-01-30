@@ -387,6 +387,7 @@ rag-cc
 
 ```bash
 rag-cc run
+!rag-cc --config configs/pipeline_colab.yaml run
 ```
 
 ### Crawl Only
@@ -407,6 +408,7 @@ data/manifests/latest.jsonl
 ```bash
 rag-cc clean
 python run_cleaning.py --config configs/pipeline.yaml
+!cc-clean --config configs/pipeline_colab.yaml
 ```
 
 Outputs:

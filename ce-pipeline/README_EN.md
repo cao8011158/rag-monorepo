@@ -19,11 +19,11 @@ Chunks → BM25 lexical index
 Each stage is explicit, deterministic, and independently debuggable,
 following a strict data-contract design.
 
-------------------------------------------------------------------------
+---
 
 # Directory Structure (Simplified)
 
-``` text
+```text
 ce_pipeline/
 ├── cli.py                 # CLI entrypoint
 ├── settings.py            # load_settings()
@@ -58,36 +58,37 @@ ce_pipeline/
     └── jsonl.py           # read_jsonl / append_jsonl
 ```
 
-------------------------------------------------------------------------
+---
 
 # Installation
 
 ## 1. Environment
 
--   Python 3.10+
--   Recommended: virtual environment
+- Python 3.10+
+- Recommended: virtual environment
 
-``` bash
+```bash
 python -m venv .venv
 source .venv/bin/activate   # Linux / macOS
+.\venv\Scripts\Activate.ps1 #powershell
 # .venv\Scripts\activate    # Windows
 ```
 
 ## 2. Install dependencies
 
-``` bash
+```bash
 pip install -r requirements.txt
 ```
 
 Typical dependencies include:
 
--   numpy\
--   orjson\
--   faiss-cpu\
--   sentence-transformers\
--   rank-bm25
+- numpy\
+- orjson\
+- faiss-cpu\
+- sentence-transformers\
+- rank-bm25
 
-------------------------------------------------------------------------
+---
 
 # Configuration (YAML)
 
@@ -95,7 +96,7 @@ The pipeline is fully configured via a single YAML file.
 
 ## 1. Input Configuration
 
-``` yaml
+```yaml
 input:
   input_store: fs_local
   input_path: cleaned/latest/documents.jsonl
@@ -103,7 +104,7 @@ input:
 
 ## 2. Output Configuration
 
-``` yaml
+```yaml
 outputs:
   chunks:
     store: fs_local
@@ -120,7 +121,7 @@ outputs:
 
 ## 3. Store Configuration
 
-``` yaml
+```yaml
 stores:
   fs_local:
     kind: filesystem
@@ -129,7 +130,7 @@ stores:
 
 ## 4. Chunking Configuration
 
-``` yaml
+```yaml
 chunking:
   window_chars: 1200
   overlap_chars: 200
@@ -138,7 +139,7 @@ chunking:
 
 ## 5. Embedding Configuration
 
-``` yaml
+```yaml
 embedding:
   model_name: sentence-transformers/all-MiniLM-L6-v2
   batch_size: 64
@@ -150,7 +151,7 @@ embedding:
 
 ## 6. Deduplication Configuration
 
-``` yaml
+```yaml
 processing:
   dedup:
     exact_dedup:
@@ -166,13 +167,13 @@ processing:
       normalize: true
 ```
 
-------------------------------------------------------------------------
+---
 
 # Data Contracts
 
 ## Input Document Schema (documents.jsonl)
 
-``` json
+```json
 {
   "doc_id": "string",
   "text": "string",
@@ -188,7 +189,7 @@ processing:
 
 ## Chunk Schema (chunks.jsonl)
 
-``` json
+```json
 {
   "chunk_id": "string",
   "doc_id": "string",
@@ -206,21 +207,22 @@ processing:
 }
 ```
 
-------------------------------------------------------------------------
+---
 
 # Running the Pipeline
 
-``` bash
+```bash
 ce run --config configs/pipeline.yaml
 ```
 
-------------------------------------------------------------------------
+---
 
 # Failure Semantics
 
-  Stage       Strategy
-  ----------- -------------
-  Chunking    Best-effort
-  Embedding   Fail-fast
-  Indexing    Best-effort
+Stage Strategy
 
+---
+
+Chunking Best-effort
+Embedding Fail-fast
+Indexing Best-effort

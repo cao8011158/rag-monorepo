@@ -5,12 +5,7 @@ import hashlib
 from typing import Any, Dict, List, Tuple
 
 from ce_pipeline.chunking.sliding_window import sliding_window_chunks
-from ce_pipeline.processing import (
-    trim_noise_edges,
-    is_noise_chunk,
-    repair_boundary_truncation,
-)
-
+from ce_pipeline.processing.repair import repair_boundary_by_sentence_syntok
 
 TEXT_FIELD = "chunk_text"
 
@@ -43,7 +38,7 @@ def _read_chunking_knobs(cfg: Dict[str, Any]) -> Tuple[int, int, int]:
 
     Returns: (window_chars, overlap_chars, min_chunk_chars)
 
-    This function is defensive: missing keys fall back to defaults.
+    Defensive defaults if missing.
     """
     c = (cfg or {}).get("chunking", {}) if isinstance(cfg, dict) else {}
     if not isinstance(c, dict):
@@ -53,7 +48,7 @@ def _read_chunking_knobs(cfg: Dict[str, Any]) -> Tuple[int, int, int]:
     overlap_chars = int(c.get("overlap_chars", 200))
     min_chunk_chars = int(c.get("min_chunk_chars", 200))
 
-    # sanity checks (avoid pathological chunking configs)
+    # sanity checks
     if window_chars <= 0:
         raise ValueError("chunking.window_chars must be > 0")
     if overlap_chars < 0:
@@ -72,29 +67,28 @@ def chunk_doc(doc: Dict[str, Any], cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
 
     Best-effort policy:
       - If the document is invalid (missing doc_id/text), return [] (skip).
-      - Chunking config errors (invalid knobs) raise ValueError (fail fast),
-        because that is a pipeline configuration bug, not data quality.
+      - Chunking config errors raise ValueError (fail fast).
 
     Input schema (doc):
       {
-        "doc_id": str,          # REQUIRED (stable identity)
+        "doc_id": str,          # REQUIRED
         "url": str,
         "title": str,
-        "text": str,            # REQUIRED (non-empty)
+        "text": str,            # REQUIRED
         "source": str,
         "content_hash": str,
         "content_type": str,
-        "fetched_at": str,k_
+        "fetched_at": str,
         "run_date": str
       }
 
     Output: List[ChunkRecord]
       {
-        "chunk_id": str,                 # sha256(doc_id::chunk_index::chunk_text)[:24]
+        "chunk_id": str,              # sha256(doc_id::chunk_index::chunk_text)[:24]
         "doc_id": str,
-        "chunk_index": int,              # document-internal window id
-        "chunk_text": str,           # chunk text content (TEXT_FIELD)
-        "chunk_text_hash": str,          # sha256(chunk_text) full hex
+        "chunk_index": int,
+        "chunk_text": str,            # TEXT_FIELD
+        "chunk_text_hash": str,       # sha256(chunk_text) full hex
         "url": str,
         "title": str,
         "source": str,
@@ -112,7 +106,6 @@ def chunk_doc(doc: Dict[str, Any], cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
 
     doc_id = str(doc.get("doc_id", "") or "").strip()
     if not doc_id:
-        # Without doc_id, chunk_id becomes unstable / collision-prone.
         return []
 
     text = doc.get("text")
@@ -123,7 +116,7 @@ def chunk_doc(doc: Dict[str, Any], cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
         return []
 
     # -----------------------
-    # 1) Read chunking knobs (TOP-LEVEL per Settings API)
+    # 1) Read chunking knobs
     # -----------------------
     window_chars, overlap_chars, min_chunk_chars = _read_chunking_knobs(cfg)
 
@@ -132,11 +125,11 @@ def chunk_doc(doc: Dict[str, Any], cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
     # -----------------------
     url = str(doc.get("url", "") or "")
     title = str(doc.get("title", "") or "")
-    source = doc.get("source", "") or ""
-    content_hash = doc.get("content_hash", "") or ""
-    content_type = doc.get("content_type", "") or ""
-    fetched_at = doc.get("fetched_at", "") or ""
-    run_date = doc.get("run_date", "") or ""
+    source = str(doc.get("source", "") or "")
+    content_hash = str(doc.get("content_hash", "") or "")
+    content_type = str(doc.get("content_type", "") or "")
+    fetched_at = str(doc.get("fetched_at", "") or "")
+    run_date = str(doc.get("run_date", "") or "")
 
     # -----------------------
     # 3) Split into raw windows
@@ -146,41 +139,53 @@ def chunk_doc(doc: Dict[str, Any], cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
     )
 
     # -----------------------
-    # 4) trim -> minlen -> noise_filter (KEEP PAIRS)
+    # 4) strip -> minlen (KEEP PAIRS)
+    #    (删除 trim_noise_edges / is_noise_chunk)
     # -----------------------
     kept: List[Tuple[int, str]] = []
     for idx, raw_chunk in parts:
         c = (raw_chunk or "").strip()
         if not c:
             continue
-
-        # ALWAYS do edge-only trim first
-        c = trim_noise_edges(c).strip()
-        if not c:
-            continue
-
-        # min length gate
         if len(c) < min_chunk_chars:
             continue
-
-        # ALWAYS do noise filter
-        if is_noise_chunk(c, min_chunk_chars=min_chunk_chars):
-            continue
-
         kept.append((int(idx), c))
 
     # -----------------------
-    # 5) boundary repair (PRESERVE idx-text alignment)
+    # 5) boundary repair (sliding pairwise):
+    #    (c0,c1)->(c1,c2)->...; i 用 cur_fixed, i+1 用 next_fixed
+    #    overlap = overlap_chars; back/forward 固定 50
     # -----------------------
-    if kept:
-        repaired_pairs: List[Tuple[int, str]] = []
-        for i, (idx, cur) in enumerate(kept):
-            prev_t = kept[i - 1][1] if i > 0 else None
-            next_t = kept[i + 1][1] if i + 1 < len(kept) else None
-            new_t = (repair_boundary_truncation(prev_t, cur, next_t) or "").strip()
-            if new_t:
-                repaired_pairs.append((idx, new_t))
-        kept = repaired_pairs
+    if len(kept) >= 2:
+        idxs = [p[0] for p in kept]
+        texts = [p[1] for p in kept]
+
+        for i in range(len(texts) - 1):
+            cur = texts[i]
+            nxt = texts[i + 1]
+
+            cur_fixed, nxt_fixed, _carry = repair_boundary_by_sentence_syntok(
+                cur,
+                nxt,
+                overlap=overlap_chars,
+                back_search=50,
+                forward_search=50,
+                # 用 min_chunk_chars 约束“修复后不能太短”，避免产出 < min_chunk_chars 的 chunk
+                min_cur_len=min_chunk_chars,
+            )
+
+            # 仍然做一下基本规范化（不改变你的步骤语义，只是防止意外空白）
+            cur_fixed = (cur_fixed or "").strip()
+            nxt_fixed = (nxt_fixed or "").strip() if nxt_fixed is not None else ""
+
+            # 由于 repair 内部已经用 min_cur_len 保护，这里不额外 drop；
+            # 只要非空就更新
+            if cur_fixed:
+                texts[i] = cur_fixed
+            if nxt_fixed:
+                texts[i + 1] = nxt_fixed
+
+        kept = list(zip(idxs, texts))
 
     # -----------------------
     # 6) emit ChunkRecords
