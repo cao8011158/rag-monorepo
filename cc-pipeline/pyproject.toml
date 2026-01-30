@@ -13,6 +13,7 @@ dependencies = [
   "tenacity>=8.2.0",
   "orjson>=3.10.0",
   "tqdm>=4.66.0",
+  "trafilatura>=1.8.0",
 ]
 
 [project.optional-dependencies]
@@ -23,6 +24,7 @@ dev = [
 
 [project.scripts]
 rag-cc = "cc_pipeline.cli:main"
+cc-clean = "run_cleaning.py:main"
 
 [build-system]
 requires = ["setuptools>=69.0.0"]

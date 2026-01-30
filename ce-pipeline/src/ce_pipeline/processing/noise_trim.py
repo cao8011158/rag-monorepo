@@ -64,6 +64,7 @@ def trim_noise_edges(text: str) -> str:
     - Edge-only trimming is intentional: mid-chunk keyword removal is risky.
     - We split the chunk into "parts" by paragraph breaks and common nav separators,
       then pop noise-like parts from the beginning and end.
+    - Adaptive thresholds are used for short chunks (e.g., 400 chars).
     """
     t = (text or "").strip()
     if not t:
@@ -73,38 +74,43 @@ def trim_noise_edges(text: str) -> str:
     if not parts:
         return ""
 
-    while parts and _part_is_edge_noise(parts[-1]):
+    chunk_len = len(t)
+    edge_cap = min(120, int(0.35 * chunk_len))
+
+    while parts and _part_is_edge_noise(parts[-1], edge_cap):
         parts.pop()
 
-    while parts and _part_is_edge_noise(parts[0]):
+    while parts and _part_is_edge_noise(parts[0], edge_cap):
         parts.pop(0)
 
     return "\n\n".join(parts).strip()
 
 
-def _part_is_edge_noise(part: str) -> bool:
+def _part_is_edge_noise(part: str, edge_cap: int) -> bool:
     """
     Decide whether a *single edge part* looks like boilerplate.
     Used internally by trim_noise_edges().
+
+    edge_cap: adaptive length threshold based on chunk length.
     """
     p = (part or "").strip()
     if not p:
         return True
 
     # Short multi-line blocks often represent nav/footer
-    if len(p) < 80 and p.count("\n") >= 2:
+    if len(p) < edge_cap and p.count("\n") >= 2:
         return True
 
     # Strong patterns at edges are safe to trim
     if _NOISE_RE_STRONG.search(p):
         return True
 
-    # Weak patterns at edges: trim only if short (avoid legit legal/editorial)
-    if _NOISE_RE_WEAK.search(p) and len(p) < 220:
+    # Weak patterns: trim only if short relative to chunk
+    if _NOISE_RE_WEAK.search(p) and len(p) < edge_cap:
         return True
 
     # Separator-heavy short parts -> likely breadcrumb/nav lists
-    if len(p) < 220:
+    if len(p) < edge_cap:
         seps = sum(p.count(ch) for ch in _SEP_CHARS)
         if seps >= 3:
             return True
