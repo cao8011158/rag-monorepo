@@ -24,7 +24,7 @@ dev = [
 
 [project.scripts]
 rag-cc = "cc_pipeline.cli:main"
-cc-clean = "run_cleaning.py:main"
+cc-clean = "cc_pipeline.run_cleaning.py:main"
 
 [build-system]
 requires = ["setuptools>=69.0.0"]
