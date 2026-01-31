@@ -58,7 +58,6 @@ def build_query_prompt(chunk_text: str, p: Dict[str, Any]) -> str:
     diversify = bool(p.get("diversify", True))
     hints = p.get("diversity_hints") or ""
     passage = (chunk_text or "")
-
     lines: List[str] = []
     lines.append(
         f"Task: generate {n} {style} queries that a user might ask to find the information in the passage."
@@ -99,7 +98,7 @@ def generate_queries_with_gemini(
     model_name: str,
     max_retries: int = 3,
     backoff_sec: float = 1.5,
-) -> Dict[str, Any]:
+) -> List[str]:
     """
     Returns: {"queries": [...]}
 
@@ -127,7 +126,7 @@ def generate_queries_with_gemini(
             )
             parsed = QueryOutput.model_validate_json(response.text)
             qs = _normalize_queries(parsed.queries, n)
-            return {"queries": qs}
+            return qs
 
         except (ValidationError, ValueError) as e:
             # 不可重试：格式/schema问题
@@ -149,7 +148,7 @@ def generate_queries_with_gemini(
 # Public API (your pipeline calls this)
 # =========================
 
-def run_query_generation(chunk_text: str, cfg: Dict[str, Any]) -> Dict[str, Any]:
+def run_query_generation(chunk_text: str, cfg: Dict[str, Any]) -> List[str]:
     """
     cfg is already-parsed dict (by your own config tool).
 
