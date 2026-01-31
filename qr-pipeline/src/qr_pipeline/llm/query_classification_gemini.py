@@ -113,15 +113,13 @@ def classify_queries_with_gemini(
 
     # ✅ 不搞“函数式改写 prompt”，只把 Q1..Qn 追加到你给的 prompt string 后面
     prompt = """Task :
-You will receive N user queries, classify each query into exactly one category:
+You will receive N user queries, for each query, assign exactly one of the following two labels:
+- IN
+- OUT
 IN: primarily about Pittsburgh or Carnegie Mellon University (CMU), and explicitly mentions "Pittsburgh" or "Carnegie Mellon University" or "CMU".
 OUT: everything else.
 Domain definition (IN):
 IN queries explicitly focus on Pittsburgh or CMU, including their history, geography, culture, population, economy, campus life, traditions, trivia, and current events.
-Decision rules:
-Choose IN only if the query is primarily about Pittsburgh or CMU AND explicitly mentions one of: "Pittsburgh", "Carnegie Mellon University", "CMU".
-Otherwise choose OUT (even if the topic could be related).
-If uncertain, choose OUT.
 
 Example :
 Input:
