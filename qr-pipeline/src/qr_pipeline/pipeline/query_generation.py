@@ -1,25 +1,29 @@
 # src/qr_pipeline/query_generation.py
-#  chunks.jsonl -> LLM generate queries -> normalize -> hash (real query_id)
-#  -> exact dedup by real query_id
-#  -> domain classify in BATCH (Q1..Qn labels + one-shot example, ID-only output)
-#  -> write queries/in_domain.jsonl and queries/out_domain.jsonl
+# chunks.jsonl -> Gemini generate queries (structured) -> postprocess -> normalize -> hash(query_id)
+# -> exact dedup by query_id (resume supported) -> Gemini domain classify in BATCH (structured in_ids/out_ids)
+# -> write queries/in_domain.jsonl and queries/out_domain.jsonl + stats checkpoints
 
 from __future__ import annotations
 
 import hashlib
+import json
 import random
 import re
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, Iterator, List, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Set, Tuple
 
-from qr_pipeline.io.jsonl import append_jsonl, read_jsonl, write_jsonl
+from pydantic import BaseModel, Field, ValidationError
+from google import genai
+
+from qr_pipeline.io.jsonl import append_jsonl, read_jsonl
 from qr_pipeline.stores.registry import build_store_registry
 
 
 # -----------------------------
 # Helpers
 # -----------------------------
+
 def _posix_join(*parts: str) -> str:
     return "/".join([p.strip("/").replace("\\", "/") for p in parts if p is not None and str(p) != ""])
 
@@ -33,7 +37,7 @@ def _make_id(norm_text: str, n: int = 24) -> str:
 
 
 def _normalize_text(text: str, *, lower: bool, strip: bool, collapse_whitespace: bool) -> str:
-    x = text
+    x = text or ""
     if strip:
         x = x.strip()
     if collapse_whitespace:
@@ -50,273 +54,234 @@ def _safe_int(x: Any, default: int) -> int:
         return default
 
 
-def _safe_float(x: Any, default: float) -> float:
-    try:
-        return float(x)
-    except Exception:
-        return default
-
-
 def _now_ms() -> int:
     return int(time.time() * 1000)
 
 
-# -----------------------------
-# LLM wrapper (hf_transformers)
-# -----------------------------
-@dataclass
-class HFTransformersLLM:
-    model_name: str
-    device: str = "cpu"  # "cpu" / "cuda"
-    cache_dir: Optional[str] = None
-    max_new_tokens: int = 128
-    temperature: float = 0.7
-    top_p: float = 0.9
-
-    def __post_init__(self) -> None:
-        try:
-            import torch  # noqa: F401
-            from transformers import AutoModelForCausalLM, AutoTokenizer  # type: ignore # noqa: F401
-        except Exception as e:
-            raise RuntimeError(
-                "Missing dependency for hf_transformers LLM. Please install transformers + torch."
-            ) from e
-
-        from transformers import AutoModelForCausalLM, AutoTokenizer  # type: ignore
-
-        self._tok = AutoTokenizer.from_pretrained(self.model_name, cache_dir=self.cache_dir, use_fast=True)
-
-        device_map: Optional[str] = "auto" if str(self.device).lower() == "cuda" else None
-
-        self._model = AutoModelForCausalLM.from_pretrained(
-            self.model_name,
-            cache_dir=self.cache_dir,
-            device_map=device_map,
-        )
-        self._model.eval()
-
-    def generate(self, prompt: str) -> str:
-        import torch  # type: ignore
-
-        inputs = self._tok(prompt, return_tensors="pt")
-        inputs = {k: v.to(self._model.device) for k, v in inputs.items()}
-
-        do_sample = (self.temperature is not None) and (self.temperature > 0.0)
-
-        with torch.no_grad():
-            out = self._model.generate(
-                **inputs,
-                max_new_tokens=int(self.max_new_tokens),
-                do_sample=bool(do_sample),
-                temperature=float(self.temperature) if do_sample else None,
-                top_p=float(self.top_p) if do_sample else None,
-                pad_token_id=self._tok.eos_token_id,
-            )
-
-        text = self._tok.decode(out[0], skip_special_tokens=True)
-        if text.startswith(prompt):
-            text = text[len(prompt) :]
-        return text.strip()
-
-
-def _build_llm_from_settings(s: Dict[str, Any]) -> Tuple[Any, str]:
-    llm_cfg = s["models"]["llm"]
-    provider = str(llm_cfg.get("provider", "hf_transformers"))
-    model_name = str(llm_cfg["model_name"])
-
-    if provider == "hf_transformers":
-        llm = HFTransformersLLM(
-            model_name=model_name,
-            device=str(llm_cfg.get("device", "cpu")),
-            cache_dir=llm_cfg.get("cache_dir"),
-            max_new_tokens=_safe_int(llm_cfg.get("max_new_tokens", 128), 128),
-            temperature=_safe_float(llm_cfg.get("temperature", 0.7), 0.7),
-            top_p=_safe_float(llm_cfg.get("top_p", 0.9), 0.9),
-        )
-        return llm, model_name
-
-    raise NotImplementedError(f"LLM provider not supported yet: {provider}")
+def _get_required(cfg: Dict[str, Any], path: str) -> Any:
+    cur: Any = cfg
+    for part in path.split("."):
+        if not isinstance(cur, dict) or part not in cur:
+            raise KeyError(f"Missing required config key: {path}")
+        cur = cur[part]
+    return cur
 
 
 # -----------------------------
-# Prompt building & parsing
+# Structured output schemas (Gemini)
 # -----------------------------
+
+class QueryOutput(BaseModel):
+    queries: List[str] = Field(description="A list of search queries.")
+
+
+class ClassifyOutput(BaseModel):
+    in_ids: List[int] = Field(description="1-based indices of IN queries, e.g. [1,3,4].")
+    out_ids: List[int] = Field(description="1-based indices of OUT queries, e.g. [2,5].")
+
+
+# -----------------------------
+# Prompt builders
+# -----------------------------
+
 def _build_query_prompt(chunk_text: str, p: Dict[str, Any]) -> str:
+    """
+    Matches your config format:
+      style: "information-seeking"
+      num_queries_per_chunk: 3
+      max_chunk_chars: 2100
+      diversify: true
+      diversity_hints: | ...
+      avoid_near_duplicates: true
+    """
     style = str(p.get("style", "information-seeking"))
     n = _safe_int(p.get("num_queries_per_chunk", 1), 1)
     diversify = bool(p.get("diversify", True))
-    hints = p.get("diversity_hints") 
+    hints = (p.get("diversity_hints") or "").strip()
+    passage = (chunk_text or "")
 
     lines: List[str] = []
     lines.append(f"Task: generate {n} {style} queries that a user might ask to find the information in the passage.")
     if diversify and hints:
-        lines.append(f"Diversify query types using these hints: {hints}.")
-    lines.append("Output format requirements:")
-    lines.append("- Output ONLY the queries.")
-    lines.append("- One query per line.")
-    lines.append("- No numbering, no bullets, no explanations.")
+        lines.append("Diversify query types using these hints:")
+        lines.append(hints)
+    lines.append("")
+    lines.append("Output requirements:")
+    lines.append("- Return JSON only (no markdown).")
+    lines.append("- Field: queries (array of strings).")
+    lines.append("- No extra fields.")
     lines.append("")
     lines.append("Passage:")
-    lines.append(chunk_text)
-    lines.append("")
-    lines.append("Queries:")
+    lines.append(passage)
     return "\n".join(lines)
 
 
-def _build_domain_batch_prompt_qstyle(items: List[Tuple[str, str]]) -> Tuple[str, Dict[str, str]]:
+def _build_domain_prompt_for_batch(queries: List[str]) -> str:
     """
-    items: List[(real_query_id, query_text_norm)]
-    prompt uses short labels Q1..Qn to reduce context burden.
-    Returns:
-      prompt_text
-      qlabel_to_real_id: {"Q1": real_id1, ...}
+    Keep your preferred long prompt, then append Input lines:
+      1: ...
+      2: ...
+    Output is structured by JSON schema (in_ids/out_ids).
     """
-    qlabel_to_real_id: Dict[str, str] = {}
-    lines: List[str] = []
-    lines.append("You are a strict classifier.")
-    lines.append("")
-    lines.append("Domain:")
-    lines.append(
-        "Questions that explicitly focus on Pittsburgh or Carnegie Mellon University (CMU). "
-        "This includes their history, geography, culture, population, economy, campus life, traditions, trivia, and current events.")
-    lines.append("")
-    lines.append("Decision rules:")
-    lines.append(
-    'Choose IN only if the query is primarily about Pittsburgh or CMU '
-    'and explicitly mentions Pittsburgh or Carnegie Mellon University (CMU).'
-    )
-    lines.append('Choose OUT for all other queries. even if the topic could be related.') 
-    lines.append("- If uncertain, choose OUT.")
-    lines.append("")
-    lines.append("Output format (strict):")
-    lines.append("IN:")
-    lines.append("Q<number>")
-    lines.append("OUT:")
-    lines.append("Q<number>")
-    lines.append("")
-    lines.append("One-shot example:")
-    lines.append("Input:")
-    lines.append("Q1\twhat year was carnegie mellon university founded")
-    lines.append("Q2\tbest universities for computer science in the us")
-    lines.append("Q3\tmajor sports teams in pittsburgh")
-    lines.append("Q4\thow did the whiskey rebellion impact pittsburgh's development")
-    lines.append("Q5\twhat was the french and indian war")
-    lines.append("")
-    lines.append("Output:")
-    lines.append("IN:")
-    lines.append("Q1")
-    lines.append("Q3")
-    lines.append("Q4")
-    lines.append("OUT:")
-    lines.append("Q2")
-    lines.append("Q5")
-    lines.append("")
-    lines.append("Now classify the following queries:")
-    lines.append("Input:")
+    base = """Task :
+You will receive N user queries, classify each query into exactly one category:
+IN: primarily about Pittsburgh or Carnegie Mellon University (CMU), and explicitly mentions "Pittsburgh" or "Carnegie Mellon University" or "CMU".
+OUT: everything else.
+Domain definition (IN):
+IN queries explicitly focus on Pittsburgh or CMU, including their history, geography, culture, population, economy, campus life, traditions, trivia, and current events.
+Decision rules:
+Choose IN only if the query is primarily about Pittsburgh or CMU AND explicitly mentions one of: "Pittsburgh", "Carnegie Mellon University", "CMU".
+Otherwise choose OUT (even if the topic could be related).
+If uncertain, choose OUT.
+
+Example :
+Input:
+1:what year was carnegie mellon university founded
+2:best universities for computer science in the us
+3:major sports teams in pittsburgh
+4:how did the whiskey rebellion impact pittsburgh's development
+5:what was the french and indian war
+
+Output:
+{"in_ids":[1,3,4],"out_ids":[2,5]}
+
+Now classify the following queries:
+"""
+
+    lines: List[str] = [base.rstrip(), "", "Input:"]
+    for i, q in enumerate(queries, start=1):
+        qq = (q or "").strip().replace("\n", " ")
+        lines.append(f"{i}: {qq}")
+    return "\n".join(lines)
 
 
-    for i, (real_id, qnorm) in enumerate(items, start=1):
-        qlabel = f"Q{i}"
-        qlabel_to_real_id[qlabel] = real_id
-        lines.append(f"{qlabel}\t{qnorm}")
+# -----------------------------
+# Post-process / validation
+# -----------------------------
 
-    lines.append("")
-    lines.append("Output:")
-    return "\n".join(lines), qlabel_to_real_id
+def _normalize_queries_list(queries: List[Any]) -> List[str]:
+    cleaned: List[str] = []
+    for q in queries:
+        if isinstance(q, str):
+            s = q.strip()
+            if s:
+                cleaned.append(s)
+    # exact-string dedup preserving order
+    return list(dict.fromkeys(cleaned))
 
 
-def _parse_queries(raw: str) -> List[str]:
-    out: List[str] = []
-    for line in raw.splitlines():
-        x = line.strip()
-        if not x:
-            continue
-        x = re.sub(r"^\s*[\-\*\u2022]\s+", "", x)
-        x = re.sub(r"^\s*\d+[\.\)\:]\s+", "", x)
-        x = x.strip()
-        if x:
+def _dedup_ints_keep_order(xs: List[int]) -> List[int]:
+    seen: Set[int] = set()
+    out: List[int] = []
+    for x in xs:
+        if isinstance(x, int) and x not in seen:
+            seen.add(x)
             out.append(x)
     return out
 
 
-def _parse_domain_batch_qstyle(raw: str, qlabel_to_real_id: Dict[str, str]) -> Tuple[Dict[str, str], List[str]]:
+def _validate_ids(
+    *,
+    in_ids: List[int],
+    out_ids: List[int],
+    n: int,
+    fill_missing_as_out: bool = True,
+) -> ClassifyOutput:
     """
-    Parse output:
-      IN:
-      Q1
-      Q3
-      OUT:
-      Q2
-    Return:
-      labels_by_real_id: {real_id: "IN"/"OUT"}
-      errors: [...]
-    Policy:
-      - unknown Q labels are errors
-      - missing labels -> OUT (conservative)
-      - if a label appears in both, OUT wins (conservative)
+    Enforce:
+    - 1 <= id <= n
+    - dedup
+    - no overlaps (IN wins)
+    - optionally fill missing as OUT
     """
-    errors: List[str] = []
-    labels_by_real_id: Dict[str, str] = {}
+    in_ids = _dedup_ints_keep_order([i for i in in_ids if 1 <= i <= n])
+    out_ids = _dedup_ints_keep_order([i for i in out_ids if 1 <= i <= n])
 
-    text = (raw or "").strip()
-    lines = text.splitlines()
+    in_set = set(in_ids)
+    out_ids = [i for i in out_ids if i not in in_set]
+    out_set = set(out_ids)
 
-    in_idx: Optional[int] = None
-    out_idx: Optional[int] = None
-    for i, ln in enumerate(lines):
-        t = ln.strip().upper()
-        if in_idx is None and t == "IN:":
-            in_idx = i
-            continue
-        if t == "OUT:":
-            out_idx = i
-            break
+    if fill_missing_as_out:
+        for i in range(1, n + 1):
+            if i not in in_set and i not in out_set:
+                out_ids.append(i)
 
-    if in_idx is None or out_idx is None or out_idx <= in_idx:
-        return labels_by_real_id, ["Missing or malformed IN:/OUT: sections."]
+    # stable order
+    in_ids = [i for i in range(1, n + 1) if i in set(in_ids)]
+    out_ids = [i for i in range(1, n + 1) if i in set(out_ids)]
+    return ClassifyOutput(in_ids=in_ids, out_ids=out_ids)
 
-    def _collect(section_lines: List[str]) -> List[str]:
-        got: List[str] = []
-        for ln in section_lines:
-            x = ln.strip()
-            if not x:
+
+# -----------------------------
+# Gemini calls (structured output)
+# -----------------------------
+
+def _gemini_generate_queries_once(
+    *,
+    model_name: str,
+    prompt: str,
+) -> List[str]:
+    client = genai.Client()
+    resp = client.models.generate_content(
+        model=model_name,
+        contents=prompt,
+        config={
+            "system_instruction": "You are a helpful assistant that generates search queries.",
+            "response_mime_type": "application/json",
+            "response_json_schema": QueryOutput.model_json_schema(),
+        },
+    )
+    parsed = QueryOutput.model_validate_json(resp.text)
+    return _normalize_queries_list(parsed.queries)
+
+
+def _gemini_classify_once(
+    *,
+    model_name: str,
+    prompt: str,
+) -> ClassifyOutput:
+    client = genai.Client()
+    resp = client.models.generate_content(
+        model=model_name,
+        contents=prompt,
+        config={
+            "system_instruction": "You are a strict classifier.",
+            "response_mime_type": "application/json",
+            "response_json_schema": ClassifyOutput.model_json_schema(),
+        },
+    )
+    parsed = ClassifyOutput.model_validate_json(resp.text)
+    return parsed
+
+
+def _with_retry(
+    *,
+    fn_name: str,
+    fn,
+    max_retries: int,
+    backoff_sec: float,
+) -> Any:
+    last_err: Exception | None = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            return fn()
+        except (ValidationError, ValueError) as e:
+            # schema / format problems: treat as non-retry (you can change this policy if desired)
+            raise RuntimeError(f"{fn_name}: invalid structured output format: {e}") from e
+        except Exception as e:
+            last_err = e
+            print(f"[WARN] {fn_name} failed (attempt {attempt}/{max_retries}): {e}")
+            if attempt < max_retries:
+                time.sleep(backoff_sec * attempt)
                 continue
-            x = re.sub(r"^\s*[\-\*\u2022]\s+", "", x)
-            x = re.sub(r"^\s*\d+[\.\)\:]\s+", "", x)
-            x = x.strip()
-            if x:
-                got.append(x)
-        return got
-
-    in_q = _collect(lines[in_idx + 1 : out_idx])
-    out_q = _collect(lines[out_idx + 1 :])
-
-    # Apply IN first, then OUT overrides if conflict
-    for q in in_q:
-        if q not in qlabel_to_real_id:
-            errors.append(f"Unknown label: {q}")
-            continue
-        real_id = qlabel_to_real_id[q]
-        labels_by_real_id[real_id] = "IN"
-
-    for q in out_q:
-        if q not in qlabel_to_real_id:
-            errors.append(f"Unknown label: {q}")
-            continue
-        real_id = qlabel_to_real_id[q]
-        labels_by_real_id[real_id] = "OUT"
-
-    # Missing -> OUT
-    for qlabel, real_id in qlabel_to_real_id.items():
-        if real_id not in labels_by_real_id:
-            labels_by_real_id[real_id] = "OUT"
-
-    return labels_by_real_id, errors
+            break
+    raise RuntimeError(f"{fn_name} failed after {max_retries} retries: {last_err}")
 
 
 # -----------------------------
 # Sampling
 # -----------------------------
+
 def _sample_chunks(rows: List[Dict[str, Any]], sampling_cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
     seed = _safe_int(sampling_cfg.get("seed", 42), 42)
     strategy = str(sampling_cfg.get("strategy", "uniform_random"))
@@ -335,17 +300,14 @@ def _sample_chunks(rows: List[Dict[str, Any]], sampling_cfg: Dict[str, Any]) -> 
 # -----------------------------
 # Main
 # -----------------------------
+
 def run_query_generation(s: Dict[str, Any]) -> Dict[str, Any]:
     """
-    chunks.jsonl -> generate queries -> normalize -> hash
-    -> domain classify (batch)
-    -> append in/out domain jsonl
-    -> stats checkpoint each batch
-    Dedup via seen_ids only (方案A：重复忽略 source_chunk_ids)
+    chunks.jsonl -> Gemini gen -> postprocess -> normalize -> hash -> dedup -> Gemini classify (batch)
+    -> append in/out domain jsonl -> stats checkpoint each batch
+    Dedup via seen_ids only (重复忽略 source_chunk_ids)
+    Target stop: IN unique == target_num_queries
     """
-
-    import json
-
     stores = build_store_registry(s)
 
     # ---- inputs ----
@@ -375,7 +337,7 @@ def run_query_generation(s: Dict[str, Any]) -> Dict[str, Any]:
     norm_cfg = qg.get("normalize", {}) or {}
 
     min_chars = _safe_int(post_cfg.get("min_query_chars", 8), 8)
-    max_chars = _safe_int(post_cfg.get("max_query_chars", 160), 160)
+    max_chars = _safe_int(post_cfg.get("max_query_chars", 200), 200)
 
     lower = bool(norm_cfg.get("lower", True))
     strip = bool(norm_cfg.get("strip", True))
@@ -383,14 +345,19 @@ def run_query_generation(s: Dict[str, Any]) -> Dict[str, Any]:
 
     prompt_style = str(prompt_cfg.get("style", "information-seeking"))
     avoid_near_duplicates = bool(prompt_cfg.get("avoid_near_duplicates", True))
+    max_chunk_chars = _safe_int(prompt_cfg.get("max_chunk_chars", 2100), 2100)
 
-    # ---- LLM ----
-    llm, llm_model_name = _build_llm_from_settings(s)
+    # ---- Gemini model ----
+    gemini_model_name = str(_get_required(s, "models.gemini_api.model_name"))
+
+    # ---- retry settings (optional config; defaults here) ----
+    max_retries = _safe_int(qg.get("gemini_max_retries", 3), 3)
+    backoff_sec = float(qg.get("gemini_backoff_sec", 1.5) or 1.5)
 
     # ---- counters ----
     read_errors = 0
-    total_llm_calls_gen = 0
-    total_llm_calls_domain = 0
+    total_gemini_calls_gen = 0
+    total_gemini_calls_domain = 0
     total_raw_queries = 0
     total_after_post = 0
     total_in_unique = 0
@@ -398,19 +365,24 @@ def run_query_generation(s: Dict[str, Any]) -> Dict[str, Any]:
     total_domain_batches = 0
     total_domain_items_classified = 0
 
-    # ---- load chunks ----
+    # ---- error writer ----
+    def _log_error(stage: str, payload: Dict[str, Any]) -> None:
+        payload = dict(payload)
+        payload["ts_ms"] = _now_ms()
+        payload["stage"] = stage
+        append_jsonl(out_store, errors_path, [payload])
+
     def _on_read_error(payload: Dict[str, Any]) -> None:
         nonlocal read_errors
         read_errors += 1
-        payload["ts_ms"] = _now_ms()
-        append_jsonl(out_store, errors_path, [payload])
+        _log_error("read_chunks", payload)
 
+    # ---- load chunks ----
     rows = list(read_jsonl(in_store, chunks_path, on_error=_on_read_error))
     sampled = _sample_chunks(rows, sampling_cfg)
 
     # ---- seen_ids (resume) ----
-    seen_ids: set[str] = set()
-
+    seen_ids: Set[str] = set()
     for path in (in_domain_path, out_domain_path):
         try:
             for r in read_jsonl(out_store, path):
@@ -423,24 +395,14 @@ def run_query_generation(s: Dict[str, Any]) -> Dict[str, Any]:
 
     print(f"[INIT] loaded seen_ids={len(seen_ids)} in={total_in_unique} out={total_out_unique}")
 
-    batch_buf: List[Dict[str, Any]] = []
-
-    def _print_state():
-        print(
-            f"[STATE] in={total_in_unique} out={total_out_unique} "
-            f"batch={total_domain_batches} "
-            f"llm_gen={total_llm_calls_gen} "
-            f"llm_domain={total_llm_calls_domain} "
-            f"seen={len(seen_ids)}"
-        )
-
-    def _write_stats_checkpoint():
+    # ---- stats checkpoint ----
+    def _write_stats_checkpoint(extra: Optional[Dict[str, Any]] = None) -> None:
         snap = {
             "ts_ms": _now_ms(),
             "counters": {
                 "read_errors": read_errors,
-                "llm_calls_generate_queries": total_llm_calls_gen,
-                "llm_calls_domain_classify_batches": total_llm_calls_domain,
+                "gemini_calls_generate_queries": total_gemini_calls_gen,
+                "gemini_calls_domain_classify_batches": total_gemini_calls_domain,
                 "domain_classify_batches": total_domain_batches,
                 "domain_classify_items": total_domain_items_classified,
                 "raw_queries_parsed": total_raw_queries,
@@ -451,62 +413,105 @@ def run_query_generation(s: Dict[str, Any]) -> Dict[str, Any]:
                 "num_queries_out_domain_unique_written": total_out_unique,
             },
             "meta": {
-                "llm_model": llm_model_name,
+                "gemini_model": gemini_model_name,
                 "prompt_style": prompt_style,
                 "target_num_in_domain": target_in_domain,
             },
         }
+        if extra:
+            snap["extra"] = extra
         out_store.write_text(stats_path, json.dumps(snap, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    def _flush_domain_batch():
-        nonlocal total_llm_calls_domain, total_domain_batches
+    def _print_state() -> None:
+        print(
+            f"[STATE] in={total_in_unique} out={total_out_unique} "
+            f"batch={total_domain_batches} "
+            f"gem_gen={total_gemini_calls_gen} "
+            f"gem_domain={total_gemini_calls_domain} "
+            f"seen={len(seen_ids)}"
+        )
+
+    # ---- batch buffer ----
+    # store both q_text (for classification) and q_norm (for storage/id)
+    batch_buf: List[Dict[str, Any]] = []
+
+    def _flush_domain_batch() -> None:
+        nonlocal total_gemini_calls_domain, total_domain_batches
         nonlocal total_domain_items_classified, total_in_unique, total_out_unique
 
         if not batch_buf:
             return
 
-        items = [(x["real_id"], x["q_norm"]) for x in batch_buf]
-        prompt, qlabel_to_real_id = _build_domain_batch_prompt_qstyle(items)
+        # build classification input (use original cleaned query text)
+        qs_for_classify = [str(x["q_text"]) for x in batch_buf]
+        prompt = _build_domain_prompt_for_batch(qs_for_classify)
 
-        raw = llm.generate(prompt)
-        total_llm_calls_domain += 1
-        total_domain_batches += 1
+        def _call() -> ClassifyOutput:
+            return _gemini_classify_once(model_name=gemini_model_name, prompt=prompt)
 
-        labels_by_real_id, _ = _parse_domain_batch_qstyle(raw, qlabel_to_real_id)
+        try:
+            parsed = _with_retry(
+                fn_name="gemini_classify",
+                fn=_call,
+                max_retries=max_retries,
+                backoff_sec=backoff_sec,
+            )
+            total_gemini_calls_domain += 1
+            total_domain_batches += 1
+        except Exception as e:
+            # if classification totally fails, log and mark all as OUT (conservative)
+            _log_error(
+                "domain_classify",
+                {
+                    "error": str(e),
+                    "batch_size": len(batch_buf),
+                },
+            )
+            parsed = ClassifyOutput(in_ids=[], out_ids=list(range(1, len(batch_buf) + 1)))
+            total_gemini_calls_domain += 1
+            total_domain_batches += 1
 
-        new_in_rows = []
-        new_out_rows = []
+        final = _validate_ids(
+            in_ids=parsed.in_ids,
+            out_ids=parsed.out_ids,
+            n=len(batch_buf),
+            fill_missing_as_out=True,
+        )
+        in_set = set(final.in_ids)  # 1-based indices
 
-        for x in batch_buf:
-            real_id = x["real_id"]
-            q_norm = x["q_norm"]
+        new_in_rows: List[Dict[str, Any]] = []
+        new_out_rows: List[Dict[str, Any]] = []
 
-            label = labels_by_real_id.get(real_id, "OUT")
+        for idx, x in enumerate(batch_buf, start=1):
+            real_id = str(x["real_id"])
+            q_norm = str(x["q_norm"])
+            chunk_id = str(x["chunk_id"])
+
+            label_in = idx in in_set
             total_domain_items_classified += 1
 
             row_obj = {
                 "query_id": real_id,
                 "query_text_norm": q_norm,
-                "source_chunk_ids": [x["chunk_id"]],
-                "llm_model": llm_model_name,
+                "source_chunk_ids": [chunk_id],
+                "llm_model": gemini_model_name,
                 "prompt_style": prompt_style,
-                "domain": "in" if label == "IN" else "out",
+                "domain": "in" if label_in else "out",
             }
 
-            if label == "IN":
+            if label_in:
                 new_in_rows.append(row_obj)
                 total_in_unique += 1
             else:
                 new_out_rows.append(row_obj)
                 total_out_unique += 1
 
-        _print_state()
-
         if new_in_rows:
             append_jsonl(out_store, in_domain_path, new_in_rows)
         if new_out_rows:
             append_jsonl(out_store, out_domain_path, new_out_rows)
 
+        _print_state()
         _write_stats_checkpoint()
         batch_buf.clear()
 
@@ -517,55 +522,78 @@ def run_query_generation(s: Dict[str, Any]) -> Dict[str, Any]:
 
         chunk_id = row.get("chunk_id")
         chunk_text = row.get("chunk_text", "")
+
         if not chunk_id or not chunk_text:
             continue
 
-        passage = chunk_text[: _safe_int(prompt_cfg.get("max_chunk_chars", 1800), 1800)]
-        prompt = _build_query_prompt(passage, prompt_cfg)
+        passage = (chunk_text or "")[:max_chunk_chars]
+        gen_prompt = _build_query_prompt(passage, prompt_cfg)
 
-        raw = llm.generate(prompt)
-        total_llm_calls_gen += 1
+        def _call_gen() -> List[str]:
+            return _gemini_generate_queries_once(model_name=gemini_model_name, prompt=gen_prompt)
 
-        queries = _parse_queries(raw)
+        try:
+            queries = _with_retry(
+                fn_name="gemini_generate_queries",
+                fn=_call_gen,
+                max_retries=max_retries,
+                backoff_sec=backoff_sec,
+            )
+            total_gemini_calls_gen += 1
+        except Exception as e:
+            _log_error(
+                "query_generate",
+                {
+                    "error": str(e),
+                    "chunk_id": str(chunk_id),
+                },
+            )
+            total_gemini_calls_gen += 1
+            continue
+
         total_raw_queries += len(queries)
 
-        seen_in_chunk: set[str] = set()
+        # per-chunk near-duplicate control (by real_id)
+        seen_in_chunk: Set[str] = set()
 
         for q in queries:
             if total_in_unique >= target_in_domain:
                 break
 
-            q = q.strip()
-            if len(q) < min_chars:
+            q_text = (q or "").strip()
+            if len(q_text) < min_chars:
                 continue
-            if len(q) > max_chars:
-                q = q[:max_chars].strip()
+            if len(q_text) > max_chars:
+                q_text = q_text[:max_chars].strip()
 
-            q_norm = _normalize_text(q, lower=lower, strip=strip, collapse_whitespace=collapse_whitespace)
+            q_norm = _normalize_text(q_text, lower=lower, strip=strip, collapse_whitespace=collapse_whitespace)
             real_id = _make_id(q_norm)
 
             if avoid_near_duplicates and real_id in seen_in_chunk:
                 continue
             seen_in_chunk.add(real_id)
 
-            # ✅ 提前 dedup
+            # global dedup (resume supported)
             if real_id in seen_ids:
                 continue
-
-            seen_ids.add(real_id)   # ✅ 在进入 batch 前加入
+            seen_ids.add(real_id)
             total_after_post += 1
 
-            batch_buf.append({"real_id": real_id, "q_norm": q_norm, "chunk_id": chunk_id})
+            batch_buf.append(
+                {
+                    "real_id": real_id,
+                    "q_norm": q_norm,
+                    "q_text": q_text,      # for classification
+                    "chunk_id": chunk_id,
+                }
+            )
 
             if len(batch_buf) >= batch_size:
                 _flush_domain_batch()
 
     _flush_domain_batch()
-    _write_stats_checkpoint()
-
+    _write_stats_checkpoint(extra={"status": "done"})
     return {"status": "done"}
-
-
 
 
 def main(config_path: str) -> None:
@@ -579,7 +607,5 @@ def main(config_path: str) -> None:
     out_store = stores[str(out_cfg["store"])]
     out_base = str(out_cfg["base"])
     stats_path = _posix_join(out_base, str(out_cfg["files"]["stats"]))
-
-    import json
 
     out_store.write_text(stats_path, json.dumps(stats, ensure_ascii=False, indent=2), encoding="utf-8")

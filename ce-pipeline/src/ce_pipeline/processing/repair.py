@@ -131,10 +131,10 @@ def repair_boundary_by_sentence_syntok(
     cur_text: str,
     next_text: str | None,
     *,
-    overlap: int = 80,
-    back_search: int = 50,
-    forward_search: int = 50,
-    min_cur_len: int = 150,
+    overlap: int = 120,
+    back_search: int = 100,
+    forward_search: int = 100,
+    min_cur_len: int = 400,
 ) -> Tuple[str, str | None, str]:
     """
     Sentence-aligned boundary repair using syntok.

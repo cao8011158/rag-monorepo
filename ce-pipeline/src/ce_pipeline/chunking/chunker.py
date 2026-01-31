@@ -168,8 +168,8 @@ def chunk_doc(doc: Dict[str, Any], cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
                 cur,
                 nxt,
                 overlap=overlap_chars,
-                back_search=50,
-                forward_search=50,
+                back_search=100,
+                forward_search=100,
                 # 用 min_chunk_chars 约束“修复后不能太短”，避免产出 < min_chunk_chars 的 chunk
                 min_cur_len=min_chunk_chars,
             )

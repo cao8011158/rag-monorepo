@@ -33,9 +33,9 @@ outputs:
 # Chunking
 # =========================
 chunking:
-  window_chars: 450
-  overlap_chars: 80
-  min_chunk_chars: 100
+  window_chars: 1000
+  overlap_chars: 120
+  min_chunk_chars: 400
 
 # =========================
 # Processing (Deduplication)
