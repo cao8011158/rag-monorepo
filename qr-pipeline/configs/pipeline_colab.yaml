@@ -92,8 +92,8 @@ query_generation:
     max_chunk_chars: 2100
     diversify: true
     diversity_hints: |
-      ask about a specific fact (who/when/where);
-      ask about a definition or explanation (what/why);
+      ask about a specific fact (who/what/when/where);
+      ask about a definition or explanation (how/why);
       ask about a relationship/comparison (how differs / related to)
     avoid_near_duplicates: true
 
