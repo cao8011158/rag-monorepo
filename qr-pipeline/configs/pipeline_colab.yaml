@@ -43,7 +43,7 @@ outputs:
 # ---------- Models ----------
 models:
   gemini_api:
-    model_name: gemini-1.5-flash
+    model_name: gemini-3-flash-preview
 
   reranker:
     provider: hf_transformers # 先按你现有 HFTransformersLLM 的风格；后面我们会用一个 HFTransformersReranker 类
