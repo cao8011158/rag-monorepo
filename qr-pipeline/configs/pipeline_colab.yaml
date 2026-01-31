@@ -42,6 +42,9 @@ outputs:
 
 # ---------- Models ----------
 models:
+  gemini_api:
+    model_name: gemini-1.5-flash
+
   reranker:
     provider: hf_transformers # 先按你现有 HFTransformersLLM 的风格；后面我们会用一个 HFTransformersReranker 类
     model_name: "BAAI/bge-reranker-v2-m3"
@@ -84,7 +87,6 @@ query_generation:
 
   # prompt template (keep it configurable)
   prompt:
-    language: en
     style: "information-seeking"
     num_queries_per_chunk: 3
     max_chunk_chars: 2100

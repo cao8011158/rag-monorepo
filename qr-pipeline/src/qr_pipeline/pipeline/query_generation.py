@@ -142,32 +142,25 @@ def _build_llm_from_settings(s: Dict[str, Any]) -> Tuple[Any, str]:
 # Prompt building & parsing
 # -----------------------------
 def _build_query_prompt(chunk_text: str, p: Dict[str, Any]) -> str:
-    lang = str(p.get("language", "en"))
     style = str(p.get("style", "information-seeking"))
     n = _safe_int(p.get("num_queries_per_chunk", 1), 1)
+    diversify = bool(p.get("diversify", True))
+    hints = p.get("diversity_hints") 
 
-    diversify = bool(p.get("diversify", False))
-    hints = p.get("diversity_hints", []) or []
-    hints_str = ", ".join([str(x) for x in hints]) if hints else ""
-
-    if lang.lower().startswith("en"):
-        lines: List[str] = []
-        lines.append("You are a helpful assistant that generates search queries.")
-        lines.append(f"Task: generate {n} {style} queries that a user might ask to find the information in the passage.")
-        if diversify and hints_str:
-            lines.append(f"Diversify query types using these hints: {hints_str}.")
-        lines.append("Output format requirements:")
-        lines.append("- Output ONLY the queries.")
-        lines.append("- One query per line.")
-        lines.append("- No numbering, no bullets, no explanations.")
-        lines.append("")
-        lines.append("Passage:")
-        lines.append(chunk_text)
-        lines.append("")
-        lines.append("Queries:")
-        return "\n".join(lines)
-
-    return _build_query_prompt(chunk_text, {**p, "language": "en"})
+    lines: List[str] = []
+    lines.append(f"Task: generate {n} {style} queries that a user might ask to find the information in the passage.")
+    if diversify and hints:
+        lines.append(f"Diversify query types using these hints: {hints}.")
+    lines.append("Output format requirements:")
+    lines.append("- Output ONLY the queries.")
+    lines.append("- One query per line.")
+    lines.append("- No numbering, no bullets, no explanations.")
+    lines.append("")
+    lines.append("Passage:")
+    lines.append(chunk_text)
+    lines.append("")
+    lines.append("Queries:")
+    return "\n".join(lines)
 
 
 def _build_domain_batch_prompt_qstyle(items: List[Tuple[str, str]]) -> Tuple[str, Dict[str, str]]:
