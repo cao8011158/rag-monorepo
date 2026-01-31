@@ -116,11 +116,8 @@ def classify_queries_with_gemini(
 You will receive N user queries, for each query, assign exactly one of the following two labels:
 - IN
 - OUT
-IN: primarily about Pittsburgh or Carnegie Mellon University (CMU), and explicitly mentions "Pittsburgh" or "Carnegie Mellon University" or "CMU".
+IN: queries about or related to Pittsburgh or Carnegie Mellon University (CMU), including their history, geography, culture, population, economy, campus life, traditions, trivia, and current events.
 OUT: everything else.
-Domain definition (IN):
-IN queries explicitly focus on Pittsburgh or CMU, including their history, geography, culture, population, economy, campus life, traditions, trivia, and current events.
-
 Example :
 Input:
 1:what year was carnegie mellon university founded
