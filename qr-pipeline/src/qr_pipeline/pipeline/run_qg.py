@@ -14,7 +14,7 @@ from qr_pipeline.settings import load_settings
 from qr_pipeline.stores.registry import build_store_registry
 from qr_pipeline.io.jsonl import read_jsonl, write_jsonl, append_jsonl
 
-from qr_pipeline.pipeline.query_generation import run_query_generation
+from qr_pipeline.pipeline.query_generation import run_query_generation_pipeline
 from qr_pipeline.processing.embedder import DualInstructEmbedder
 from qr_pipeline.processing.near_dedup import near_dedup_by_ann_faiss
 
@@ -271,7 +271,7 @@ def run_pipeline(config_path: str) -> Dict[str, Any]:
     # stage: query generation
     # -----------------------------
     t0 = time.perf_counter()
-    qg_stats = run_query_generation(s)
+    qg_stats = run_query_generation_pipeline(s)
     t_query_generation = time.perf_counter() - t0
 
     # -----------------------------
