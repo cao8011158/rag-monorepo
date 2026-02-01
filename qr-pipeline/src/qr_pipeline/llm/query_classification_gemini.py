@@ -113,11 +113,13 @@ def classify_queries_with_gemini(
 
     # ✅ 不搞“函数式改写 prompt”，只把 Q1..Qn 追加到你给的 prompt string 后面
     prompt = """Task :
-You will receive N user queries, for each query, assign exactly one of the following two labels:
+You will receive N user queries, For each query, assign exactly one of the following two labels:
 - IN
 - OUT
-IN: queries about or related to Pittsburgh or Carnegie Mellon University (CMU), including their history, geography, culture, population, economy, campus life, traditions, trivia, and current events.
+IN: primarily about Pittsburgh or Carnegie Mellon University (CMU), including their history, geography, culture, population, economy, campus life, traditions, trivia, and current events.
 OUT: everything else.
+If uncertain, choose OUT.
+
 Example :
 Input:
 1:what year was carnegie mellon university founded

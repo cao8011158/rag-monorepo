@@ -14,6 +14,7 @@ dependencies = [
   "orjson>=3.10.0",
   "tqdm>=4.66.0",
   "trafilatura>=1.8.0",
+  "docling>=2.71.0",
 ]
 
 [project.optional-dependencies]

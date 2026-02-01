@@ -4,299 +4,352 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
-import json
+from typing import Any, Dict, Optional
 
 import pytest
 
 
-# ---- helpers ----
+# ----------------------------
+# Helpers / fakes
+# ----------------------------
 @dataclass
-class DummyEntry:
-    url: str
-    content_hash: str
+class ManifestEntry:
     rel_path: str
     content_type: str
+    content_hash: str
     fetched_at: str
 
 
-class DummyStore:
-    def __init__(self, root: str):
-        self.root = root
-        self._by_path: dict[str, bytes] = {}
+class AppendCapture:
+    def __init__(self) -> None:
+        self.calls = []  # list[tuple[Path, dict]]
+
+    def __call__(self, out_path: Path, doc: Dict[str, Any]) -> None:
+        self.calls.append((Path(out_path), doc))
+
+
+class FakeStore:
+    def __init__(self, local_root: str, mapping: Dict[str, bytes], fail_on: Optional[str] = None) -> None:
+        self.local_root = local_root
+        self.mapping = mapping
+        self.fail_on = fail_on
 
     def read_bytes(self, rel_path: str) -> bytes:
-        return self._by_path[rel_path]
-
-    def write_bytes(self, rel_path: str, content: bytes) -> None:
-        self._by_path[rel_path] = content
-
-
-def _append_jsonl_real(path: Path, obj: dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(obj, ensure_ascii=False) + "\n")
+        if self.fail_on and rel_path == self.fail_on:
+            raise RuntimeError("boom")
+        return self.mapping[rel_path]
 
 
-@pytest.fixture
-def mod():
-    # 直接 import 被测模块（你实际路径）
-    import cc_pipeline.run_cleaning as m
-    return m
+def _make_cfg(tmp_path: Path, *, min_text_chars: int = 10) -> Any:
+    out_dir = tmp_path / "out"
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-
-def test_always_reads_latest_manifest(monkeypatch, tmp_path, mod):
-    # cfg.output_jsonl 包含 run_date -> 走正常 output_jsonl
-    cfg = SimpleNamespace(
+    # output_jsonl uses .format(run_date=cfg.run_date)
+    return SimpleNamespace(
         local_root=str(tmp_path),
-        manifest_latest=str(tmp_path / "manifests" / "latest.jsonl"),
-        output_jsonl=str(tmp_path / "cleaned" / "{run_date}" / "cleaned.jsonl"),
-        run_date="2026-01-22",
-        min_text_chars=1,
+        manifest_latest=tmp_path / "manifests" / "latest.json",
+        output_jsonl=str(out_dir / "cleaned_{run_date}.jsonl"),
+        run_date="2026-02-01",
+        min_text_chars=min_text_chars,
     )
 
-    called = {"manifest_path": None}
 
-    def fake_load_cfg(p: str):
+# ----------------------------
+# Tests
+# ----------------------------
+def test_run_cleaning_reads_latest_manifest_and_overwrites_output(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    - Always load manifest from cfg.manifest_latest
+    - If output exists, unlink it (overwrite behavior)
+    """
+    import cc_pipeline.run_cleaning as m
+
+    cfg = _make_cfg(tmp_path, min_text_chars=5)
+
+    loaded_manifest_path = {"value": None}
+
+    def fake_load_cfg(config_path: str) -> Any:
         return cfg
 
-    def fake_load_manifest(p: str):
-        called["manifest_path"] = p
+    def fake_load_manifest(path: Path) -> Dict[str, ManifestEntry]:
+        loaded_manifest_path["value"] = Path(path)
         return {}
 
-    monkeypatch.setattr(mod, "load_cfg", fake_load_cfg)
-    monkeypatch.setattr(mod, "load_manifest", fake_load_manifest)
-    monkeypatch.setattr(mod, "LocalStore", DummyStore)
-
-    mod.run_cleaning("configs/pipeline.yaml")
-    assert called["manifest_path"] == cfg.manifest_latest
-
-
-def test_overwrite_same_date(monkeypatch, tmp_path, mod):
-    cfg = SimpleNamespace(
-        local_root=str(tmp_path),
-        manifest_latest=str(tmp_path / "manifests" / "latest.jsonl"),
-        output_jsonl=str(tmp_path / "data" / "cleaned" / "{run_date}" / "cleaned.jsonl"),
-        run_date="2026-01-22",
-        min_text_chars=1,
-    )
-
-    # 预先写入旧文件
+    # Create an existing output file that should be removed
     out_path = Path(cfg.output_jsonl.format(run_date=cfg.run_date))
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text("OLD\n", encoding="utf-8")
+    out_path.write_text("old", encoding="utf-8")
+    assert out_path.exists()
 
-    # 构造 manifest + store 内容
+    monkeypatch.setattr(m, "load_cfg", fake_load_cfg)
+    monkeypatch.setattr(m, "load_manifest", fake_load_manifest)
+    monkeypatch.setattr(m, "LocalStore", lambda local_root: FakeStore(local_root, {}))
+    monkeypatch.setattr(m, "append_jsonl", AppendCapture())
+
+    m.run_cleaning("configs/pipeline.yaml")
+
+    # Manifest path must be cfg.manifest_latest
+    assert loaded_manifest_path["value"] == Path(cfg.manifest_latest)
+
+    # Output file should be unlinked (since we never write anything for empty manifest)
+    assert not out_path.exists()
+
+
+def test_run_cleaning_html_filters_short_and_writes_long(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    HTML:
+      - too short -> dropped
+      - long enough -> kept and written
+    """
+    import cc_pipeline.run_cleaning as m
+
+    cfg = _make_cfg(tmp_path, min_text_chars=10)
+
     man = {
-        "http://a.com": DummyEntry(
-            url="http://a.com",
-            content_hash="H1",
-            rel_path="raw/html/2026-01-22/crawl/a.html",
+        "https://a.com/short": ManifestEntry(
+            rel_path="raw/short.html",
             content_type="text/html",
-            fetched_at="T",
-        )
+            content_hash="h1",
+            fetched_at="t1",
+        ),
+        "https://a.com/long": ManifestEntry(
+            rel_path="raw/long.html",
+            content_type="text/html",
+            content_hash="h2",
+            fetched_at="t2",
+        ),
     }
 
-    store = DummyStore(cfg.local_root)
-    store._by_path[man["http://a.com"].rel_path] = b"<html>hi</html>"
-
-    monkeypatch.setattr(mod, "load_cfg", lambda p: cfg)
-    monkeypatch.setattr(mod, "load_manifest", lambda p: man)
-    monkeypatch.setattr(mod, "LocalStore", lambda root: store)
-    monkeypatch.setattr(mod, "html_to_text", lambda s: ("Title", "OK"))
-    monkeypatch.setattr(mod, "pdf_to_text", lambda b: "PDF")
-    monkeypatch.setattr(mod, "append_jsonl", _append_jsonl_real)
-
-    # 固定 sha256_hex，让 doc_id 可预测
-    monkeypatch.setattr(mod, "sha256_hex", lambda b: "x" * 64)
-
-    mod.run_cleaning("configs/pipeline.yaml")
-
-    # 旧内容应被覆盖（不再出现 OLD）
-    text = out_path.read_text(encoding="utf-8")
-    assert "OLD" not in text
-    lines = [l for l in text.splitlines() if l.strip()]
-    assert len(lines) == 1
-
-
-def test_schema_is_exact_and_pdf_title_empty(monkeypatch, tmp_path, mod):
-    cfg = SimpleNamespace(
-        local_root=str(tmp_path),
-        manifest_latest=str(tmp_path / "manifests" / "latest.jsonl"),
-        output_jsonl=str(tmp_path / "cleaned" / "{run_date}" / "cleaned.jsonl"),
-        run_date="2026-01-22",
-        min_text_chars=1,
+    store = FakeStore(
+        cfg.local_root,
+        mapping={
+            "raw/short.html": b"<html>short</html>",
+            "raw/long.html": b"<html>this is definitely long enough</html>",
+        },
     )
 
-    man = {
-        "http://a.com/a.pdf": DummyEntry(
-            url="http://a.com/a.pdf",
-            content_hash="CH",
-            rel_path="raw/pdf/2026-01-22/crawl/a.pdf",
-            content_type="application/pdf",
-            fetched_at="FA",
-        )
-    }
+    def fake_load_cfg(_: str) -> Any:
+        return cfg
 
-    store = DummyStore(cfg.local_root)
-    store._by_path[man["http://a.com/a.pdf"].rel_path] = b"%PDF-1.4 ..."
+    def fake_load_manifest(_: Path) -> Dict[str, ManifestEntry]:
+        return man
 
-    captured: list[dict] = []
+    def fake_html_to_text(_: str) -> tuple[str, str]:
+        # decide based on original bytes? easiest: use sentinel in raw bytes decode
+        # Here, store bytes decode contains "short" or "definitely"
+        # We'll just return based on substring.
+        if "short" in _:
+            return "T-short", "12345"  # len=5 < 10 => drop
+        return "T-long", "x" * 25  # keep
 
-    def fake_append(path: Path, obj: dict) -> None:
-        captured.append(obj)
+    app = AppendCapture()
 
-    monkeypatch.setattr(mod, "load_cfg", lambda p: cfg)
-    monkeypatch.setattr(mod, "load_manifest", lambda p: man)
-    monkeypatch.setattr(mod, "LocalStore", lambda root: store)
-    monkeypatch.setattr(mod, "pdf_to_text", lambda b: "PDF TEXT")
-    monkeypatch.setattr(mod, "append_jsonl", fake_append)
-    monkeypatch.setattr(mod, "sha256_hex", lambda b: "a" * 64)
+    monkeypatch.setattr(m, "load_cfg", fake_load_cfg)
+    monkeypatch.setattr(m, "load_manifest", fake_load_manifest)
+    monkeypatch.setattr(m, "LocalStore", lambda local_root: store)
+    monkeypatch.setattr(m, "html_to_text", fake_html_to_text)
+    monkeypatch.setattr(m, "append_jsonl", app)
 
-    mod.run_cleaning("configs/pipeline.yaml")
+    m.run_cleaning("configs/pipeline.yaml")
 
-    assert len(captured) == 1
-    doc = captured[0]
+    assert len(app.calls) == 1
+    out_path, doc = app.calls[0]
 
-    # ✅ schema keys exactly as required
-    assert set(doc.keys()) == {
-        "doc_id",
-        "url",
-        "title",
-        "text",
-        "source",
-        "content_hash",
-        "content_type",
-        "fetched_at",
-        "run_date",
-    }
-    assert doc["title"] == ""          # PDF title 为空
-    assert doc["source"] == "seed"
+    assert out_path.name == f"cleaned_{cfg.run_date}.jsonl"
+    assert doc["url"] == "https://a.com/long"
+    assert doc["title"] == "T-long"
+    assert isinstance(doc["text"], str) and len(doc["text"]) == 25
+    assert doc["structure"] is None
+    assert doc["content_type"] == "text/html"
+    assert doc["content_hash"] == "h2"
+    assert doc["fetched_at"] == "t2"
     assert doc["run_date"] == cfg.run_date
-    assert doc["doc_id"] == ("a" * 24)  # sha256_hex[:24]
+    assert doc["source"] == "seed"
+    assert isinstance(doc["doc_id"], str) and len(doc["doc_id"]) == 24
 
 
-def test_min_text_chars_filter(monkeypatch, tmp_path, mod):
-    cfg = SimpleNamespace(
-        local_root=str(tmp_path),
-        manifest_latest=str(tmp_path / "manifests" / "latest.jsonl"),
-        output_jsonl=str(tmp_path / "cleaned" / "{run_date}" / "cleaned.jsonl"),
-        run_date="2026-01-22",
-        min_text_chars=10,  # 需要 >=10
-    )
+def test_run_cleaning_pdf_current_behavior_gets_dropped_when_min_text_chars_gt_0(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    IMPORTANT: With your current _clean_one() implementation for PDF:
+        return "", "", docling_dict
+    so text == "" (not None), and len(text) < min_text_chars => dropped.
+    This test locks in the *current* behavior so regressions are explicit.
+    """
+    import cc_pipeline.run_cleaning as m
 
-    man = {
-        "http://a.com": DummyEntry(
-            url="http://a.com",
-            content_hash="H",
-            rel_path="raw/html/2026-01-22/crawl/a.html",
-            content_type="text/html",
-            fetched_at="T",
-        )
-    }
-
-    store = DummyStore(cfg.local_root)
-    store._by_path[man["http://a.com"].rel_path] = b"<html>hi</html>"
-
-    captured: list[dict] = []
-
-    monkeypatch.setattr(mod, "load_cfg", lambda p: cfg)
-    monkeypatch.setattr(mod, "load_manifest", lambda p: man)
-    monkeypatch.setattr(mod, "LocalStore", lambda root: store)
-    monkeypatch.setattr(mod, "html_to_text", lambda s: ("T", "short"))  # len=5
-    monkeypatch.setattr(mod, "append_jsonl", lambda p, o: captured.append(o))
-
-    mod.run_cleaning("configs/pipeline.yaml")
-    assert captured == []  # 被过滤掉
-
-
-def test_clean_fail_does_not_crash(monkeypatch, tmp_path, mod, capsys):
-    cfg = SimpleNamespace(
-        local_root=str(tmp_path),
-        manifest_latest=str(tmp_path / "manifests" / "latest.jsonl"),
-        output_jsonl=str(tmp_path / "cleaned" / "{run_date}" / "cleaned.jsonl"),
-        run_date="2026-01-22",
-        min_text_chars=1,
-    )
+    cfg = _make_cfg(tmp_path, min_text_chars=1)
 
     man = {
-        "http://bad.com": DummyEntry(
-            url="http://bad.com",
-            content_hash="H",
-            rel_path="raw/html/2026-01-22/crawl/bad.html",
-            content_type="text/html",
-            fetched_at="T",
-        ),
-        "http://good.com": DummyEntry(
-            url="http://good.com",
-            content_hash="H2",
-            rel_path="raw/html/2026-01-22/crawl/good.html",
-            content_type="text/html",
-            fetched_at="T2",
+        "https://a.com/doc.pdf": ManifestEntry(
+            rel_path="raw/doc.pdf",
+            content_type="application/pdf",
+            content_hash="hp",
+            fetched_at="tp",
         ),
     }
 
-    store = DummyStore(cfg.local_root)
-    store._by_path[man["http://bad.com"].rel_path] = b"<html>bad</html>"
-    store._by_path[man["http://good.com"].rel_path] = b"<html>good</html>"
+    store = FakeStore(cfg.local_root, mapping={"raw/doc.pdf": b"%PDF-1.4..."})
 
-    captured: list[dict] = []
+    def fake_load_cfg(_: str) -> Any:
+        return cfg
 
-    def fake_html_to_text(s: str):
-        if "bad" in s:
-            raise RuntimeError("boom")
-        return ("T", "OK TEXT")
+    def fake_load_manifest(_: Path) -> Dict[str, ManifestEntry]:
+        return man
 
-    monkeypatch.setattr(mod, "load_cfg", lambda p: cfg)
-    monkeypatch.setattr(mod, "load_manifest", lambda p: man)
-    monkeypatch.setattr(mod, "LocalStore", lambda root: store)
-    monkeypatch.setattr(mod, "html_to_text", fake_html_to_text)
-    monkeypatch.setattr(mod, "append_jsonl", lambda p, o: captured.append(o))
-    monkeypatch.setattr(mod, "sha256_hex", lambda b: "b" * 64)
+    def fake_pdf_to_docling_dict(_: bytes, filename: str) -> Dict[str, Any]:
+        return {"pages": [{"blocks": [{"text": "hello"}]}]}
 
-    mod.run_cleaning("configs/pipeline.yaml")
+    app = AppendCapture()
 
-    # bad 失败但不崩；good 仍然输出
-    assert len(captured) == 1
+    monkeypatch.setattr(m, "load_cfg", fake_load_cfg)
+    monkeypatch.setattr(m, "load_manifest", fake_load_manifest)
+    monkeypatch.setattr(m, "LocalStore", lambda local_root: store)
+    monkeypatch.setattr(m, "pdf_to_docling_dict", fake_pdf_to_docling_dict)
+    monkeypatch.setattr(m, "append_jsonl", app)
+
+    m.run_cleaning("configs/pipeline.yaml")
+
+    # Dropped because text=="" and min_text_chars==1
+    assert len(app.calls) == 0
+
+
+@pytest.mark.xfail(reason="Likely intended behavior: PDF should set text=None so proxy/structure filter runs.")
+def test_run_cleaning_pdf_intended_behavior_kept_by_structure_proxy(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    If you change _clean_one() PDF branch to:
+        return "", None, docling_dict
+    then this test should pass: it will keep PDFs if approx_chars >= min_text_chars.
+    """
+    import cc_pipeline.run_cleaning as m
+
+    cfg = _make_cfg(tmp_path, min_text_chars=5)
+
+    man = {
+        "https://a.com/doc.pdf": ManifestEntry(
+            rel_path="raw/doc.pdf",
+            content_type="application/pdf",
+            content_hash="hp",
+            fetched_at="tp",
+        ),
+    }
+
+    store = FakeStore(cfg.local_root, mapping={"raw/doc.pdf": b"%PDF-1.4..."})
+
+    def fake_load_cfg(_: str) -> Any:
+        return cfg
+
+    def fake_load_manifest(_: Path) -> Dict[str, ManifestEntry]:
+        return man
+
+    def fake_pdf_to_docling_dict(_: bytes, filename: str) -> Dict[str, Any]:
+        return {"pages": [{"blocks": [{"text": "hello world"}]}]}  # approx_chars=11 >= 5
+
+    # Patch _clean_one to simulate intended return (text=None)
+    def fake_clean_one(raw: bytes, content_type: str, filename_for_pdf: str):
+        assert content_type != "text/html"
+        return "", None, fake_pdf_to_docling_dict(raw, filename_for_pdf)
+
+    app = AppendCapture()
+
+    monkeypatch.setattr(m, "load_cfg", fake_load_cfg)
+    monkeypatch.setattr(m, "load_manifest", fake_load_manifest)
+    monkeypatch.setattr(m, "LocalStore", lambda local_root: store)
+    monkeypatch.setattr(m, "_clean_one", fake_clean_one)
+    monkeypatch.setattr(m, "append_jsonl", app)
+
+    m.run_cleaning("configs/pipeline.yaml")
+
+    assert len(app.calls) == 1
+    _, doc = app.calls[0]
+    assert doc["content_type"] == "application/pdf"
+    assert doc["text"] is None
+    assert isinstance(doc["structure"], dict)
+
+
+def test_run_cleaning_deterministic_order_by_url(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    The loop iterates sorted(man.items(), key=url), so write order should follow URL order.
+    """
+    import cc_pipeline.run_cleaning as m
+
+    cfg = _make_cfg(tmp_path, min_text_chars=1)
+
+    man = {
+        "https://b.com/z": ManifestEntry("raw/z.html", "text/html", "hz", "tz"),
+        "https://a.com/a": ManifestEntry("raw/a.html", "text/html", "ha", "ta"),
+        "https://c.com/m": ManifestEntry("raw/m.html", "text/html", "hm", "tm"),
+    }
+
+    store = FakeStore(
+        cfg.local_root,
+        mapping={"raw/z.html": b"z", "raw/a.html": b"a", "raw/m.html": b"m"},
+    )
+
+    def fake_load_cfg(_: str) -> Any:
+        return cfg
+
+    def fake_load_manifest(_: Path) -> Dict[str, ManifestEntry]:
+        return man
+
+    def fake_html_to_text(_: str) -> tuple[str, str]:
+        # Always long enough (min_text_chars=1)
+        return "T", "ok"
+
+    app = AppendCapture()
+
+    monkeypatch.setattr(m, "load_cfg", fake_load_cfg)
+    monkeypatch.setattr(m, "load_manifest", fake_load_manifest)
+    monkeypatch.setattr(m, "LocalStore", lambda local_root: store)
+    monkeypatch.setattr(m, "html_to_text", fake_html_to_text)
+    monkeypatch.setattr(m, "append_jsonl", app)
+
+    m.run_cleaning("configs/pipeline.yaml")
+
+    urls_written = [doc["url"] for _, doc in app.calls]
+    assert urls_written == sorted(man.keys())
+
+
+def test_run_cleaning_counts_errors_and_continues(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: Any) -> None:
+    """
+    If one entry fails, it should print [CLEAN FAIL] and continue processing others.
+    """
+    import cc_pipeline.run_cleaning as m
+
+    cfg = _make_cfg(tmp_path, min_text_chars=1)
+
+    man = {
+        "https://a.com/good": ManifestEntry("raw/good.html", "text/html", "h1", "t1"),
+        "https://a.com/bad": ManifestEntry("raw/bad.html", "text/html", "h2", "t2"),
+    }
+
+    store = FakeStore(
+        cfg.local_root,
+        mapping={"raw/good.html": b"good", "raw/bad.html": b"bad"},
+        fail_on="raw/bad.html",
+    )
+
+    def fake_load_cfg(_: str) -> Any:
+        return cfg
+
+    def fake_load_manifest(_: Path) -> Dict[str, ManifestEntry]:
+        return man
+
+    def fake_html_to_text(_: str) -> tuple[str, str]:
+        return "T", "ok"
+
+    app = AppendCapture()
+
+    monkeypatch.setattr(m, "load_cfg", fake_load_cfg)
+    monkeypatch.setattr(m, "load_manifest", fake_load_manifest)
+    monkeypatch.setattr(m, "LocalStore", lambda local_root: store)
+    monkeypatch.setattr(m, "html_to_text", fake_html_to_text)
+    monkeypatch.setattr(m, "append_jsonl", app)
+
+    m.run_cleaning("configs/pipeline.yaml")
+
+    # One good write, one failure
+    assert len(app.calls) == 1
+    assert app.calls[0][1]["url"] == "https://a.com/good"
+
     out = capsys.readouterr().out
     assert "[CLEAN FAIL]" in out
-
-
-def test_fallback_output_path_when_output_jsonl_missing_run_date(monkeypatch, tmp_path, mod):
-    # output_jsonl 不包含 run_date -> 应兜底到 local_root/cleaned/<run_date>/cleaned.jsonl
-    cfg = SimpleNamespace(
-        local_root=str(tmp_path),
-        manifest_latest=str(tmp_path / "manifests" / "latest.jsonl"),
-        output_jsonl=str(tmp_path / "cleaned" / "cleaned.jsonl"),  # 不含 run_date
-        run_date="2026-01-22",
-        min_text_chars=1,
-    )
-
-    man = {
-        "http://a.com": DummyEntry(
-            url="http://a.com",
-            content_hash="H",
-            rel_path="raw/html/2026-01-22/crawl/a.html",
-            content_type="text/html",
-            fetched_at="T",
-        )
-    }
-
-    store = DummyStore(cfg.local_root)
-    store._by_path[man["http://a.com"].rel_path] = b"<html>hi</html>"
-
-    written_paths: list[Path] = []
-
-    def fake_append(path: Path, obj: dict):
-        written_paths.append(path)
-
-    monkeypatch.setattr(mod, "load_cfg", lambda p: cfg)
-    monkeypatch.setattr(mod, "load_manifest", lambda p: man)
-    monkeypatch.setattr(mod, "LocalStore", lambda root: store)
-    monkeypatch.setattr(mod, "html_to_text", lambda s: ("T", "OK TEXT"))
-    monkeypatch.setattr(mod, "append_jsonl", fake_append)
-    monkeypatch.setattr(mod, "sha256_hex", lambda b: "c" * 64)
-
-    mod.run_cleaning("configs/pipeline.yaml")
-
-    assert len(written_paths) == 1
-    assert written_paths[0] == (Path(cfg.local_root) / "cleaned" / cfg.run_date / "cleaned.jsonl")

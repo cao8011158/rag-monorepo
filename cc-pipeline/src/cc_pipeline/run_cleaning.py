@@ -3,14 +3,35 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
+from typing import Any, Dict, Optional, Tuple
 
 from cc_pipeline.settings import load_cfg
 from cc_pipeline.common.hashing import sha256_hex
 from cc_pipeline.common.io import LocalStore
 from cc_pipeline.crawl.manifest import load_manifest
 from cc_pipeline.clean.html_cleaner import html_to_text
-from cc_pipeline.clean.pdf_cleaner import pdf_to_text
+from cc_pipeline.clean.pdf_cleaner import pdf_to_docling_dict
 from cc_pipeline.clean.writer import append_jsonl
+
+
+def _clean_one(
+    raw: bytes,
+    content_type: str,
+    filename_for_pdf: str,
+) -> Tuple[str, Optional[str], Optional[Dict[str, Any]]]:
+    """
+    Returns: (title, text, structure)
+      - HTML: title, text=str, structure=None
+      - PDF:  title="", text=None, structure=dict
+    """
+    if content_type == "text/html":
+        title, text = html_to_text(raw.decode("utf-8", errors="ignore"))
+        return title, text, None
+
+    # Treat all non-html as pdf per your existing behavior.
+    # If you later add more content types, adjust here.
+    docling_dict = pdf_to_docling_dict(raw, filename=filename_for_pdf)
+    return "", None, docling_dict
 
 
 def run_cleaning(config_path: str) -> None:
@@ -45,26 +66,67 @@ def run_cleaning(config_path: str) -> None:
         try:
             raw = store.read_bytes(e.rel_path)
 
-            if e.content_type == "text/html":
-                title, text = html_to_text(raw.decode("utf-8", errors="ignore"))
-            else:
-                title, text = "", pdf_to_text(raw)
+            # Use rel_path (or url) as filename for PDF provenance
+            filename_for_pdf = getattr(e, "rel_path", None) or url.rsplit("/", 1)[-1] or "document.pdf"
 
-            if len(text) < cfg.min_text_chars:
-                dropped_too_short += 1
-                continue
+            title, text, structure = _clean_one(
+                raw=raw,
+                content_type=e.content_type,
+                filename_for_pdf=filename_for_pdf,
+            )
+
+            # Length filter:
+            # - HTML: check len(text)
+            # - PDF: no text => check serialized structure size as a proxy
+            #   (keeps behavior similar: drop "too short" docs)
+            if text is not None:
+                if len(text) < cfg.min_text_chars:
+                    dropped_too_short += 1
+                    continue
+            else:
+                # structure is expected for PDF
+                # If conversion failed silently and structure is empty, treat as too short
+                if not structure:
+                    dropped_too_short += 1
+                    continue
+
+                # Optional proxy filter: if structure is extremely small, drop it
+                # (You can remove this if you prefer keeping all structured PDFs)
+                # Using a conservative heuristic:
+                # - try to count some text content if present in docling export
+                # - fallback: keep it
+                try:
+                    # common-ish place where docling stores pages/blocks with text
+                    pages = structure.get("pages", [])
+                    approx_chars = 0
+                    if isinstance(pages, list):
+                        for p in pages:
+                            blks = p.get("blocks", [])
+                            if isinstance(blks, list):
+                                for b in blks:
+                                    t = b.get("text")
+                                    if isinstance(t, str):
+                                        approx_chars += len(t)
+                    if approx_chars and approx_chars < cfg.min_text_chars:
+                        dropped_too_short += 1
+                        continue
+                except Exception:
+                    # If heuristic fails, do not drop
+                    pass
 
             doc = {
                 "doc_id": sha256_hex((url + e.content_hash).encode("utf-8"))[:24],
                 "url": url,
                 "title": title,
-                "text": text,
+                "text": text,                 # HTML: str, PDF: ""
+                "structure": structure,       # HTML: None, PDF: dict
                 "source": "seed",
                 "content_hash": e.content_hash,
                 "content_type": e.content_type,
                 "fetched_at": e.fetched_at,
                 "run_date": cfg.run_date,
             }
+
             append_jsonl(out_path, doc)
             kept += 1
 
