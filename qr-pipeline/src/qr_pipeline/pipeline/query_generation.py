@@ -379,16 +379,27 @@ def run_query_generation_pipeline(s: Dict[str, Any]) -> Dict[str, Any]:
         batch_buf.clear()
 
     # ---------------- Loop ----------------
+    total_in = 0
     for row in sampled:
+        
         if total_in_unique >= target_in_domain:
             break
 
+        total_in += 1
         chunk_id = row.get("chunk_id")
         chunk_text = row.get("chunk_text", "")
-        if not chunk_id or not chunk_text:
-            continue
+        chunk_title = row.get("title")
 
-        passage = (chunk_text or "")[:max_chunk_chars]
+        if not isinstance(chunk_id, str) or not chunk_id:
+            raise KeyError(f"Row #{total_in}: missing/invalid 'chunk_id'")
+        if not isinstance(chunk_text, str) or not chunk_text:
+            raise KeyError(f"Row #{total_in}: missing/invalid 'chunk_text'")
+        if isinstance(chunk_title, str) and chunk_title.strip():
+            full_text = f"{chunk_title} {chunk_text}"
+        else:
+            full_text = chunk_text
+
+        passage = full_text[:max_chunk_chars]
 
         # NEW: call your generator (returns List[str])
         try:
