@@ -110,14 +110,18 @@ def run_embedding_stage(s: Dict[str, Any]) -> EmbeddingStageResult:
 
         cid = row.get("chunk_id")
         txt = row.get("chunk_text")
+        title = row.get("title")
 
         if not isinstance(cid, str) or not cid:
             raise KeyError(f"Row #{total_in}: missing/invalid 'chunk_id'")
         if not isinstance(txt, str) or not txt:
             raise KeyError(f"Row #{total_in}: missing/invalid 'chunk_text'")
-
+        if isinstance(title, str) and title.strip():
+            full_text = f"{title} {txt}"
+        else:
+            full_text = txt
         chunk_ids.append(cid)
-        texts.append(txt)
+        texts.append(full_text)
 
     if not texts:
         # 仍然写出空产物，保证可复现

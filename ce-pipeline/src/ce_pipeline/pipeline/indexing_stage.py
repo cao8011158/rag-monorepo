@@ -76,11 +76,8 @@ def run_indexing_stage(cfg: Dict[str, Any], *, best_effort: bool = True) -> Dict
     for row in read_jsonl(chunks_store, chunks_rel, on_error=on_error):
         # 你要求：提取 chunk_id 和 text
         cid = row.get("chunk_id")
-        txt = row.get("text")
-
-        # 如果你的 chunk schema 里字段名不同（比如 chunk_text），这里可以按需兼容
-        if txt is None:
-            txt = row.get("chunk_text")
+        txt = row.get("chunk_text")
+        title = row.get("title")
 
         if not cid or not isinstance(cid, str):
             # 这里属于“坏数据”，在 best_effort 下直接跳过并记一条
@@ -97,7 +94,7 @@ def run_indexing_stage(cfg: Dict[str, Any], *, best_effort: bool = True) -> Dict
                 continue
             raise KeyError("Missing or invalid 'chunk_id' in chunk row")
 
-        if txt is None or not isinstance(txt, str):
+        if not isinstance(txt, str) or not txt.strip():
             if best_effort and on_error is not None:
                 on_error(
                     {
@@ -110,9 +107,13 @@ def run_indexing_stage(cfg: Dict[str, Any], *, best_effort: bool = True) -> Dict
                 )
                 continue
             raise KeyError("Missing or invalid 'text' in chunk row")
+        if isinstance(title, str) and title.strip():
+            full_text = f"{title} {txt}"
+        else:
+            full_text = txt
 
         doc_ids.append(cid)
-        texts.append(txt)
+        texts.append(full_text)
 
     if not texts:
         raise ValueError(f"No valid chunks found in {chunks_rel}; cannot build BM25 index.")
