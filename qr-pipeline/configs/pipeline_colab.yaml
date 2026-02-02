@@ -77,7 +77,7 @@ models:
 
 # ---------- Query generation ----------
 query_generation:
-  target_num_queries: 500
+  target_num_queries: 2100
 
   # how to sample chunks for query generation
   sampling:
