@@ -36,7 +36,7 @@ outputs:
   files:
     queries_in_domain: queries/in_domain.jsonl
     queries_out_domain: queries/out_domain.jsonl
-    pairs: pairs/query_pack.jsonl
+    pairs: pairs/query_packs.jsonl
     stats: run_stats.json
     errors: errors.jsonl
 
@@ -139,13 +139,13 @@ processing:
 # ---------- Retrieval ----------
 retrieval:
   mode: hybrid # dense | bm25 | hybrid
-  top_k: 30 # candidates pool per query
+  top_k: 15 # candidates pool per query
 
   dense:
-    top_k: 30
+    top_k: 15
 
   bm25:
-    top_k: 60
+    top_k: 30
 
   hybrid_fusion:
     method: rrf # rrf | linear

@@ -1,13 +1,15 @@
 # src/qr_pipeline/llm/pairing.py
 from __future__ import annotations
 
-import hashlib
-import re
-from typing import Any, Dict, List, Sequence, Tuple, TypedDict, Optional
+from typing import Any, Dict, List, Sequence, Tuple, TypedDict, cast
+
+import numpy as np
+
+from qr_pipeline.llm.doc_classification_gemini import run_gemini_classification_PN
 
 
 # -----------------------------
-# Schemas
+# Types (match run_pairing.py)
 # -----------------------------
 class ChunkDoc(TypedDict, total=False):
     chunk_id: str
@@ -15,7 +17,7 @@ class ChunkDoc(TypedDict, total=False):
     chunk_index: int
     chunk_text: str
     chunk_text_hash: str
-
+    # optional passthrough fields:
     url: str
     title: str
     source: str
@@ -32,7 +34,7 @@ class Query(TypedDict, total=False):
     domain: str
 
 
-class QueryPack(TypedDict):
+class QueryPack(TypedDict, total=False):
     query: Query
     positives: List[ChunkDoc]
     negatives: List[ChunkDoc]
@@ -40,330 +42,215 @@ class QueryPack(TypedDict):
 
 
 # -----------------------------
-# Text helpers
+# Small utils
 # -----------------------------
-_WS_RE = re.compile(r"\s+", re.UNICODE)
-
-
-def _norm_text(s: str) -> str:
-    return _WS_RE.sub(" ", (s or "").strip()).lower()
-
-
-def _sha1(s: str) -> str:
-    return hashlib.sha1((s or "").encode("utf-8")).hexdigest()
-
-
 def _safe_str(x: Any) -> str:
     return "" if x is None else str(x)
 
 
-def _get_chunk_id(d: Any) -> str:
-    if not isinstance(d, dict):
-        return ""
-    return _safe_str(d.get("chunk_id")).strip()
+def _dedup_by_chunk_id_keep_order(docs: Sequence[ChunkDoc]) -> List[ChunkDoc]:
+    out: List[ChunkDoc] = []
+    seen: set[str] = set()
+    for d in docs:
+        cid = _safe_str(d.get("chunk_id")).strip()
+        if not cid or cid in seen:
+            continue
+        seen.add(cid)
+        out.append(d)
+    return out
 
 
-def _get_chunk_text(d: Any) -> str:
-    if not isinstance(d, dict):
-        return ""
-    return _safe_str(d.get("chunk_text")).strip()
+def _validate_positive_ids(positive_ids: List[Any], n: int) -> List[int]:
+    """
+    Gemini returns 0-based indices. We enforce:
+      - int coercion
+      - 0 <= id < n
+      - dedup
+      - stable order (by document order)
+    """
+    cleaned: List[int] = []
+    for x in positive_ids:
+        try:
+            cleaned.append(int(x))
+        except Exception:
+            continue
+
+    cleaned = [i for i in cleaned if 0 <= i < n]
+
+    # dedup keep order
+    seen: set[int] = set()
+    dedup: List[int] = []
+    for i in cleaned:
+        if i in seen:
+            continue
+        seen.add(i)
+        dedup.append(i)
+
+    # stable by doc order
+    s = set(dedup)
+    return [i for i in range(n) if i in s]
 
 
-# -----------------------------
-# Vector helpers (optional)
-# -----------------------------
-def _to_2d_float_array(x: Any) -> Any:
-    try:
-        import numpy as np
-    except Exception:
-        return x
+def _normalize_rows(x: np.ndarray) -> np.ndarray:
+    denom = np.linalg.norm(x, axis=1, keepdims=True) + 1e-12
+    return x / denom
 
-    if hasattr(x, "detach") and hasattr(x, "cpu") and hasattr(x, "numpy"):
-        x = x.detach().cpu().numpy()
 
-    arr = np.asarray(x, dtype=np.float32)
-    if arr.ndim == 1:
-        arr = arr.reshape(1, -1)
+def _embed_passages(embedder: Any, texts: List[str]) -> np.ndarray:
+    """
+      DualInstructEmbedder provides:
+      encode_passages(passages: List[str]) -> np.ndarray
+    """
+    fn = getattr(embedder, "encode_passages", None)
+    if not callable(fn):
+        raise AttributeError("embedder must provide encode_passages(passages: List[str]) -> np.ndarray")
+
+    vecs = fn(texts)
+    arr = np.asarray(vecs, dtype=np.float32)
+    if arr.ndim != 2 or arr.shape[0] != len(texts):
+        raise ValueError(f"embedder.encode_passages returned invalid shape: {arr.shape}")
     return arr
 
 
-def _dot(a: Any, b: Any) -> float:
-    try:
-        import numpy as np
-    except Exception:
-        return float(sum(float(x) * float(y) for x, y in zip(a, b)))
+def _cosine_dedup_keep_order(
+    *,
+    source_doc: ChunkDoc,
+    candidate_docs: Sequence[ChunkDoc],
+    embedder: Any,
+    cosine_threshold: float = 0.90,
+) -> List[ChunkDoc]:
+    """
+    Greedy cosine dedup (stable order):
 
-    a1 = np.asarray(a, dtype=np.float32).reshape(-1)
-    b1 = np.asarray(b, dtype=np.float32).reshape(-1)
-    return float(a1.dot(b1))
+    - source_doc is ALWAYS kept, but it is NOT returned.
+      It is only used as an always-present reference in the "kept set".
+    - candidate_docs are scanned in order; a candidate is dropped if its cosine
+      similarity with ANY kept vector (including source_doc) is > threshold.
+
+    Returns:
+      deduped candidates (NOT including source_doc)
+    """
+    src_text = _safe_str(source_doc.get("chunk_text")).strip()
+
+    # filter empty candidate text to avoid embedder issues
+    filtered_docs: List[ChunkDoc] = []
+    filtered_texts: List[str] = []
+    for d in candidate_docs:
+        t = _safe_str(d.get("chunk_text")).strip()
+        if not t:
+            continue
+        filtered_docs.append(d)
+        filtered_texts.append(t)
+
+    if not filtered_docs:
+        return []
+
+    # embed once: [source] + candidates
+    all_texts = [src_text] + filtered_texts
+    vecs = _embed_passages(embedder, all_texts)
+    vecs = _normalize_rows(vecs)
+
+    src_vec = vecs[0]      # (D,)
+    cand_vecs = vecs[1:]   # (M, D)
+
+    kept_docs: List[ChunkDoc] = []
+    kept_vecs: List[np.ndarray] = [src_vec]  # include source in kept set
+
+    for i, d in enumerate(filtered_docs):
+        v = cand_vecs[i]
+        K = np.stack(kept_vecs, axis=0).astype(np.float32)  # (k, D)
+        sims = K @ v                                        # (k,)
+        if float(np.max(sims)) > float(cosine_threshold):
+            continue
+        kept_docs.append(d)
+        kept_vecs.append(v)
+
+    return kept_docs
 
 
 # -----------------------------
-# Main (reranker + margin)
+# Public API used by run_pairing
 # -----------------------------
 def build_pairs_for_query(
     *,
     query: Query,
     source_doc: ChunkDoc,
-    candidate_docs: Sequence[ChunkDoc],  # from retriever (top_k=30). order doesn't matter; reranker will rerank.
-    reranker: Any,                       # reranker.score(query_text, docs_texts)->list[float]
-    embedder: Optional[Any] = None,       # optional: embedder.encode_passages(list[str])->vecs (normalized recommended)
-    # knobs
-    max_extra_positives: int = 2,
-    extra_pos_margin: float = 0.8,        # margin m in (s_i - s_10 >= m)
-    neg_rank_start: int = 10,             # 1-indexed rank start
-    neg_rank_end: int = 24,               # 1-indexed rank end (inclusive)
-    num_hard_negatives: int = 15,         # final cap
-    cosine_threshold: float = 0.92,       # only used if embedder is provided
-    enable_text_hash_dedup: bool = True,
+    candidate_docs: Sequence[ChunkDoc],
+    cfg: Dict[str, Any],
+    embedder: Any,
+    cosine_threshold: float = 0.92,
 ) -> Tuple[QueryPack, Dict[str, Any]]:
-    if not hasattr(reranker, "score"):
-        raise TypeError("reranker must have method .score(query_text, docs_texts)->list[float].")
+    """
+    Gemini PN pairing strategy (NO reranker scores, NO extra positives margin):
 
-    query_text = _safe_str(query.get("query_text")).strip()
-    if not query_text:
-        raise ValueError("query['query_text'] is required and must be non-empty.")
+    Steps:
+      1) Remove source_doc from retrieved candidate_docs (by chunk_id).
+      2) Candidate internal dedup:
+           - chunk_id dedup (always)
+           - chunk_text_hash dedup (optional)
+      3) Cosine dedup using [source_doc + candidates], where:
+           - source_doc is always kept (as reference)
+           - candidates with cosine > threshold to any kept are dropped
+      4) Call Gemini classifier on deduped candidates ONLY (excluding source_doc):
+           run_gemini_classification_PN(query, documents, cfg) -> {"positive_ids":[...]}
+      5) positives = [source_doc] + candidates[positive_ids]
+         negatives = remaining candidates
+         NOTE: negatives may be empty; still emit QueryPack
+    """
+    qtext = _safe_str(query.get("query_text")).strip()
+    src_cid = _safe_str(source_doc.get("chunk_id")).strip()
 
-    src_cid = _get_chunk_id(source_doc)
-    if not src_cid:
-        raise ValueError("source_doc['chunk_id'] is required and must be non-empty.")
+    # (1) remove source from candidates
+    filtered: List[ChunkDoc] = []
+    for d in candidate_docs:
+        cid = _safe_str(d.get("chunk_id")).strip()
+        if not cid:
+            continue
+        if src_cid and cid == src_cid:
+            continue
+        filtered.append(d)
 
-    src_text = _get_chunk_text(source_doc)
-    if not src_text:
-        raise ValueError("source_doc['chunk_text'] is required and must be non-empty.")
+    # (2) candidate internal dedup
+    filtered = _dedup_by_chunk_id_keep_order(filtered)
 
-    # copy query (avoid side-effects)
-    query_out: Query = dict(query)
-    scids = query_out.get("source_chunk_ids")
-    if not isinstance(scids, list) or not scids:
-        query_out["source_chunk_ids"] = [src_cid]
+    # (3) cosine dedup (source always kept as reference)
+    deduped = _cosine_dedup_keep_order(
+        source_doc=source_doc,
+        candidate_docs=filtered,
+        embedder=embedder,
+        cosine_threshold=float(cosine_threshold),
+    )
+
+    # (4) Gemini classification on candidates ONLY (no source)
+    documents = [_safe_str(d.get("chunk_text")).strip() for d in deduped]
+    raw = run_gemini_classification_PN(query=qtext, documents=documents, cfg=cfg)
+
+    pos_any = raw.get("positive_ids") if isinstance(raw, dict) else []
+    pos_ids = _validate_positive_ids(cast(List[Any], pos_any), n=len(deduped))
+
+    # (5) build positives/negatives
+    extra_pos = [deduped[i] for i in pos_ids]
+    pos_set = set(pos_ids)
+    negatives = [d for i, d in enumerate(deduped) if i not in pos_set]
+
+    positives: List[ChunkDoc] = [source_doc] + extra_pos  # source ALWAYS included
+
+    pack: QueryPack = {
+        "query": query,
+        "positives": positives,
+        "negatives": negatives,  # can be []
+        "meta": {
+            "method": "gemini_pn",
+        },
+    }
 
     stats: Dict[str, Any] = {
         "num_candidates_in": len(candidate_docs),
-        "max_extra_positives": int(max_extra_positives),
-        "extra_pos_margin": float(extra_pos_margin),
-        "neg_rank_start": int(neg_rank_start),
-        "neg_rank_end": int(neg_rank_end),
-        "num_hard_negatives": int(num_hard_negatives),
-        "enable_text_hash_dedup": bool(enable_text_hash_dedup),
-        "cosine_threshold": float(cosine_threshold),
-        "used_embedder_cosine_filter": bool(embedder is not None),
+        "num_candidates_after_remove_source": len(filtered),
+        "num_candidates_after_cos_dedup": len(deduped),
+        "num_docs_sent_to_gemini": len(deduped),
+        "num_extra_positives": len(extra_pos),
+        "num_negatives": len(negatives),
     }
 
-    # ---- build doc_by_id (first wins), ensure source overrides
-    doc_by_id: Dict[str, ChunkDoc] = {}
-    dup_cid = 0
-    bad_no_cid = 0
-    for d in candidate_docs:
-        cid = _get_chunk_id(d)
-        if not cid:
-            bad_no_cid += 1
-            continue
-        if cid in doc_by_id:
-            dup_cid += 1
-            continue
-        doc_by_id[cid] = d
-
-    doc_by_id[src_cid] = source_doc
-    if bad_no_cid:
-        stats["bad_candidate_no_chunk_id"] = bad_no_cid
-    if dup_cid:
-        stats["dup_candidate_chunk_id"] = dup_cid
-
-    # ---- rerank: score [source_doc] + candidates (source score first)
-    cand_ids: List[str] = []
-    cand_texts: List[str] = []
-    for cid, d in doc_by_id.items():
-        if cid == src_cid:
-            continue
-        txt = _get_chunk_text(d)
-        if not txt:
-            continue
-        cand_ids.append(cid)
-        cand_texts.append(txt)
-
-    stats["num_candidates_scored"] = len(cand_ids)
-
-    # If no candidates (only source exists), we still return with source_score only
-    if not cand_ids:
-        source_score_only = reranker.score(query_text, [src_text])
-        if not isinstance(source_score_only, list) or len(source_score_only) != 1:
-            raise RuntimeError("reranker.score returned invalid source-only score.")
-        src_score = float(source_score_only[0])
-        stats["source_score"] = src_score
-        stats["rerank_scores"] = [src_score]  # source at first
-        pack: QueryPack = {
-            "query": query_out,
-            "positives": [source_doc],
-            "negatives": [],
-            "meta": {"stats": stats},
-        }
-        stats["num_samples"] = 1
-        return pack, stats
-
-    # score source + candidates together
-    all_texts = [src_text] + cand_texts
-    all_scores = reranker.score(query_text, all_texts)
-    if not isinstance(all_scores, list) or len(all_scores) != len(all_texts):
-        raise RuntimeError(
-            f"reranker.score returned invalid scores: len(scores)={len(all_scores)} len(texts)={len(all_texts)}"
-        )
-
-    source_score = float(all_scores[0])
-    cand_scores = [float(s) for s in all_scores[1:]]
-
-    stats["source_score"] = source_score
-
-    # sort candidates by score desc (training logic uses this)
-    ranked = sorted(zip(cand_ids, cand_scores), key=lambda x: float(x[1]), reverse=True)
-    ranked_ids = [cid for cid, _ in ranked]
-    ranked_scores = [float(s) for _, s in ranked]  # candidates only, sorted
-
-    # ✅ 你要的：source 分数放第一个，然后接 candidates(sorted) 的分数
-    stats["rerank_scores"] = [source_score] + ranked_scores
-
-    # ---- determine s10 (rank is 1-indexed)  (based on candidates, not including source)
-    if len(ranked_scores) >= int(neg_rank_start):
-        s10 = ranked_scores[int(neg_rank_start) - 1]
-        stats["s10_score"] = float(s10)
-        allow_extra_pos = True
-    else:
-        stats["s10_score"] = None
-        allow_extra_pos = False
-        stats["note"] = "not enough reranked candidates to define s10; extra positives disabled"
-
-    # ---- positives:
-    kept_pos_ids: List[str] = [src_cid]
-
-    extra_ids: List[str] = []
-    if allow_extra_pos and int(max_extra_positives) > 0:
-        m = float(extra_pos_margin)
-        k = int(max_extra_positives)
-
-        for i in range(min(len(ranked_ids), max(2, k))):  # look at top few
-            cid = ranked_ids[i]
-            si = ranked_scores[i]
-            if (si - s10) >= m:
-                extra_ids.append(cid)
-            if len(extra_ids) >= k:
-                break
-
-    stats["extra_pos_by_margin_raw"] = list(extra_ids)
-
-    # optional: hash dedup against source/previous positives
-    if enable_text_hash_dedup:
-        seen_h: set[str] = set()
-
-        def _get_hash(cid: str) -> str:
-            doc = doc_by_id.get(cid, {})
-            h = _safe_str(doc.get("chunk_text_hash")).strip()
-            if h:
-                return h
-            return _sha1(_norm_text(_get_chunk_text(doc)))
-
-        seen_h.add(_get_hash(src_cid))
-
-        extra_dedup: List[str] = []
-        for cid in extra_ids:
-            h = _get_hash(cid)
-            if h in seen_h:
-                continue
-            seen_h.add(h)
-            extra_dedup.append(cid)
-        extra_ids = extra_dedup
-
-    # optional: cosine dedup against source/positives (if embedder provided)
-    if embedder is not None and extra_ids:
-        pos_texts = [_get_chunk_text(doc_by_id[src_cid])] + [_get_chunk_text(doc_by_id[cid]) for cid in extra_ids]
-        vecs = _to_2d_float_array(embedder.encode_passages(pos_texts))
-
-        keep_extra: List[str] = []
-        kept_vec_idx = [0]  # source idx=0
-        for i, cid in enumerate(extra_ids, start=1):
-            keep = True
-            for j in kept_vec_idx:
-                sim = _dot(vecs[i], vecs[j])
-                if sim > float(cosine_threshold):
-                    keep = False
-                    break
-            if keep:
-                keep_extra.append(cid)
-                kept_vec_idx.append(i)
-        extra_ids = keep_extra
-
-    kept_pos_ids.extend(extra_ids)
-    stats["num_pos_kept_final"] = len(kept_pos_ids)
-    stats["num_extra_pos_final"] = max(0, len(kept_pos_ids) - 1)
-
-    kept_pos_set = set(kept_pos_ids)
-
-    # ---- negatives: take ranks [neg_rank_start, neg_rank_end], 1-indexed, inclusive (candidates only)
-    ns = int(neg_rank_start)
-    ne = int(neg_rank_end)
-    if ns < 1:
-        ns = 1
-    if ne < ns:
-        ne = ns
-
-    start0 = ns - 1
-    end0 = min(ne, len(ranked_ids))
-    window_ids = ranked_ids[start0:end0]
-
-    neg_pool = [cid for cid in window_ids if cid not in kept_pos_set]
-    stats["num_neg_pool_window"] = len(neg_pool)
-
-    filtered_neg_ids: List[str] = []
-    if embedder is not None and neg_pool:
-        pos_texts2 = [_get_chunk_text(doc_by_id[pid]) for pid in kept_pos_ids]
-        neg_texts2 = [_get_chunk_text(doc_by_id[nid]) for nid in neg_pool]
-
-        pos_vecs = _to_2d_float_array(embedder.encode_passages(pos_texts2))
-        neg_vecs = _to_2d_float_array(embedder.encode_passages(neg_texts2))
-
-        for i, nid in enumerate(neg_pool):
-            max_sim = -1.0
-            for p in range(len(kept_pos_ids)):
-                sim = _dot(pos_vecs[p], neg_vecs[i])
-                if sim > max_sim:
-                    max_sim = sim
-            if max_sim > float(cosine_threshold):
-                continue
-            filtered_neg_ids.append(nid)
-    else:
-        filtered_neg_ids = neg_pool
-
-    stats["num_neg_after_cos_filter"] = len(filtered_neg_ids)
-
-    if enable_text_hash_dedup and filtered_neg_ids:
-        seen_h2: set[str] = set()
-        deduped: List[str] = []
-        for nid in filtered_neg_ids:
-            doc = doc_by_id.get(nid, {})
-            h = _safe_str(doc.get("chunk_text_hash")).strip()
-            if not h:
-                h = _sha1(_norm_text(_get_chunk_text(doc)))
-            if h in seen_h2:
-                continue
-            seen_h2.add(h)
-            deduped.append(nid)
-        filtered_neg_ids = deduped
-
-    stats["num_neg_after_hash_dedup"] = len(filtered_neg_ids)
-
-    k_neg = max(0, int(num_hard_negatives))
-    final_neg_ids = filtered_neg_ids[:k_neg]
-    stats["num_neg_final"] = len(final_neg_ids)
-    stats["neg_shortage"] = max(0, k_neg - len(final_neg_ids))
-
-    pos_docs_final: List[ChunkDoc] = [doc_by_id[pid] for pid in kept_pos_ids if pid in doc_by_id]
-    neg_docs_final: List[ChunkDoc] = [doc_by_id[nid] for nid in final_neg_ids if nid in doc_by_id]
-
-    pack: QueryPack = {
-        "query": query_out,
-        "positives": pos_docs_final,
-        "negatives": neg_docs_final,
-        "meta": {"stats": stats},
-    }
-
-    stats["num_samples"] = 1
     return pack, stats

@@ -1,4 +1,6 @@
-# src/qr_pipeline/pipeline/run_pairing.py
+# -----------------------------
+# run_pairing + main (single-script friendly)
+# -----------------------------
 from __future__ import annotations
 
 import argparse
@@ -10,10 +12,10 @@ from dataclasses import dataclass
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, TypedDict, cast
 
 from qr_pipeline.io.jsonl import append_jsonl, read_jsonl, write_jsonl
-from qr_pipeline.llm.pairing import build_pairs_for_query
 from qr_pipeline.llm.retrieval import HybridRetriever
 from qr_pipeline.settings import load_settings
 from qr_pipeline.stores.registry import build_store_registry
+from qr_pipeline.llm.pairing import build_pairs_for_query
 
 
 # -----------------------------
@@ -112,7 +114,6 @@ def _read_query_rows(
 
 
 def _row_to_query(row: Dict[str, Any]) -> Query:
-    # JSONL: query_text_norm -> pairing Query: query_text
     qtext = _safe_str(row.get("query_text_norm") or row.get("query_text")).strip()
 
     src_ids = [
@@ -249,22 +250,16 @@ def _get_dict(d: Dict[str, Any], key: str) -> Dict[str, Any]:
 def run_pairing(
     config_path: str,
     *,
-    reranker: Any,
     embedder: Any,
     buffer_size: int = 15,
     best_effort: bool = True,
 ) -> RunPairingResult:
     """
-    Read queries (outputs.files.queries_in_domain) -> for each query:
-      - retrieve top_k candidates
-      - rerank candidates with cross-encoder reranker
-      - build QueryPack with:
-          positives = [source_chunk] + (optional extra positives by margin)
-          negatives = rank-band [10..24] excluding positives (with optional cosine filter)
-    Writes QueryPack JSONL to outputs.files.pairs.
-
-    - best_effort=True: catch per-query exceptions -> errors.jsonl
-    - best_effort=False: fail fast
+    Streamed pairing:
+      - read queries_in_domain
+      - retrieve candidates via HybridRetriever
+      - build QueryPack via build_pairs_for_query (Gemini PN + cosine dedup)
+      - append-jsonl flush every buffer_size packs to outputs.files.pairs
     """
     t0 = _now()
     settings: Dict[str, Any] = load_settings(config_path)
@@ -293,25 +288,18 @@ def run_pairing(
     chunks_store = stores[chunks_store_name]
     chunks_path = _join_posix(chunks_base, chunks_file)
 
-    # -------- pair construction config --------
+    # -------- pair construction config (keep same knobs) --------
     pcfg = _get_dict(settings, "pair_construction")
+    pair_cfg = _get_dict(_get_dict(pcfg, "pairing"), "")  # safe
+    # 你原文件里是 pcfg["pairing"] / pcfg["filters"] 等
+    # 为了和你原结构一致，这里按原命名再取一次：
     pair_cfg = _get_dict(pcfg, "pairing")
     filters_cfg = _get_dict(pcfg, "filters")
-    hneg_cfg = _get_dict(pcfg, "hard_negatives")
 
-    # pairing knobs (with safe defaults)
-    max_extra_positives = int(pair_cfg.get("max_extra_positives", 2) or 2)
-    extra_pos_margin = float(pair_cfg.get("extra_pos_margin", 0.8) or 0.8)
-    neg_rank_start = int(pair_cfg.get("neg_rank_start", 10) or 10)
-    neg_rank_end = int(pair_cfg.get("neg_rank_end", 24) or 24)
     enable_text_hash_dedup = bool(pair_cfg.get("enable_text_hash_dedup", True))
 
-    # negatives knobs
-    num_hard_negatives = int(hneg_cfg.get("num_hard_negatives", 15) or 15)
-
-    # similarity filter knobs (only meaningful because you keep embedder)
-    enable_similarity_filter = bool(filters_cfg.get("enable_similarity_filter", True))
-    max_cosine_with_positive = float(filters_cfg.get("max_cosine_with_positive", pair_cfg.get("cosine_threshold", 0.92)) or 0.92)
+    # 你现在 cosine 去重固定需要 embedder，所以保留阈值配置
+    cosine_threshold = float(filters_cfg.get("cosine_threshold", filters_cfg.get("max_cosine_with_positive", 0.90)) or 0.90)
 
     # -------- error logger (best-effort only) --------
     def _log_err(payload: Dict[str, Any]) -> None:
@@ -343,7 +331,9 @@ def run_pairing(
     )
     t_s1 = _now()
 
-    # -------- reset outputs --------
+    # -------- reset outputs (overwrite mode) --------
+    # 你想“每次覆盖重跑”，就保留这段；
+    # 如果你想“断点续跑 append”，删掉这段或加 --resume 开关
     try:
         write_jsonl(out_store, pairs_path, [])
     except Exception:
@@ -386,28 +376,21 @@ def run_pairing(
         retrieved_items: List[Dict[str, Any]] = retriever.retrieve(qtext)
         candidate_docs = _convert_retrieval_items_to_chunkdocs(retrieved_items)
 
-        # pairing: reranker + margin strategy
+        # NEW pairing: Gemini PN + cosine dedup (cfg = full settings)
         pack, stats = build_pairs_for_query(
             query=query_obj,
             source_doc=source_doc,
             candidate_docs=candidate_docs,
-            reranker=reranker,
-            embedder=(embedder if enable_similarity_filter else None),
-            max_extra_positives=max_extra_positives,
-            extra_pos_margin=extra_pos_margin,
-            neg_rank_start=neg_rank_start,
-            neg_rank_end=neg_rank_end,
-            num_hard_negatives=num_hard_negatives,
-            cosine_threshold=max_cosine_with_positive,
-            enable_text_hash_dedup=enable_text_hash_dedup,
+            cfg=settings,
+            embedder=embedder,
+            cosine_threshold=cosine_threshold,
         )
 
-        # ensure stats is present in pack.meta.stats
-        if isinstance(pack, dict):
-            meta = pack.get("meta") if isinstance(pack.get("meta"), dict) else {}
-            if not isinstance(meta.get("stats"), dict):
-                meta["stats"] = stats
-            pack["meta"] = meta
+        # positives must contain source_doc at least
+        pos = pack.get("positives") if isinstance(pack.get("positives"), list) else []
+        if not pos:
+            # 理论上不会发生；保险兜底
+            pack["positives"] = [source_doc]
 
         buf.append(cast(QueryPack, pack))
         num_processed += 1
@@ -424,7 +407,7 @@ def run_pairing(
 
     t_loop0 = _now()
 
-    for idx, row in enumerate(query_rows, start=1):
+    for row in query_rows:
         if best_effort:
             try:
                 _process_one(row)
@@ -487,7 +470,9 @@ def run_pairing(
 # CLI
 # -----------------------------
 def main(argv: Optional[Sequence[str]] = None) -> None:
-    p = argparse.ArgumentParser(description="Run pairing (reranker+margin): queries_in_domain -> QueryPack jsonl.")
+    p = argparse.ArgumentParser(
+        description="Run pairing (Gemini PN + cosine dedup): queries_in_domain -> QueryPack jsonl."
+    )
     p.add_argument("--config", required=True, help="Path to pipeline yaml, e.g. configs/pipeline.yaml")
     p.add_argument("--buffer", type=int, default=15, help="Flush buffer size (QueryPack rows)")
     p.add_argument(
@@ -498,54 +483,28 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     args = p.parse_args(list(argv) if argv is not None else None)
 
     settings = load_settings(args.config)
-
-    # -------------------------
-    # Reranker config: models.reranker
-    # -------------------------
     models_cfg = settings.get("models", {}) if isinstance(settings.get("models"), dict) else {}
-    rk_cfg = models_cfg.get("reranker", {}) if isinstance(models_cfg.get("reranker"), dict) else {}
-
-    from qr_pipeline.llm.hf_transformers_reranker import HFTransformersReranker
-
-    reranker = HFTransformersReranker(
-        model_name=_safe_str(rk_cfg.get("model_name", "")),
-        device=_safe_str(rk_cfg.get("device", "cpu")) or "cpu",
-        cache_dir=rk_cfg.get("cache_dir"),
-        batch_size=int(rk_cfg.get("batch_size", 32) or 32),
-        max_length=int(rk_cfg.get("max_length", 512) or 512),
-        fp16=bool(rk_cfg.get("fp16", True)),
-    )
-    reranker.load()
-
-    # -------------------------
-    # Embedder config: models.embedding (kept)
-    # -------------------------
-    from qr_pipeline.processing.embedder import DualInstructEmbedder
-
     emb_cfg = models_cfg.get("embedding", {})
     if not isinstance(emb_cfg, dict):
         emb_cfg = {}
-
     instr_cfg = emb_cfg.get("instructions", {})
     if not isinstance(instr_cfg, dict):
         instr_cfg = {}
 
-    model_name = _safe_str(emb_cfg.get("model") or emb_cfg.get("model_name"))
-    if not model_name:
-        raise ValueError("models.embedding.model (or model_name) is required in config")
+    # Build DualInstructEmbedder (you provided the class)
+    from qr_pipeline.processing.embedder import DualInstructEmbedder
 
     embedder = DualInstructEmbedder(
-        model_name=model_name,
+        model_name=_safe_str(emb_cfg.get("model_name") or emb_cfg.get("model") or emb_cfg.get("model_name")),
         passage_instruction=_safe_str(instr_cfg.get("passage", "")),
         query_instruction=_safe_str(instr_cfg.get("query", "")),
         batch_size=int(emb_cfg.get("batch_size", 64) or 64),
         normalize_embeddings=bool(emb_cfg.get("normalize_embeddings", True)),
-        device=emb_cfg.get("device"),  # None / "cpu" / "cuda"
+        device=emb_cfg.get("device"),
     )
 
     res = run_pairing(
         args.config,
-        reranker=reranker,
         embedder=embedder,
         buffer_size=int(args.buffer),
         best_effort=(not args.fail_fast),
