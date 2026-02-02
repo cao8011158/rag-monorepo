@@ -224,6 +224,7 @@ def build_pairs_for_query(
     # (4) Gemini classification on candidates ONLY (no source)
     documents = [_safe_str(d.get("chunk_text")).strip() for d in deduped]
     raw = run_gemini_classification_PN(query=qtext, documents=documents, cfg=cfg)
+    print(raw)
 
     pos_any = raw.get("positive_ids") if isinstance(raw, dict) else []
     pos_ids = _validate_positive_ids(cast(List[Any], pos_any), n=len(deduped))
@@ -243,6 +244,7 @@ def build_pairs_for_query(
             "method": "gemini_pn",
         },
     }
+    print(pack)
 
     stats: Dict[str, Any] = {
         "num_candidates_in": len(candidate_docs),
