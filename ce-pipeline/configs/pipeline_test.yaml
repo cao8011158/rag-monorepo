@@ -4,7 +4,7 @@
 stores:
   fs_local:
     kind: filesystem
-    root: /content/drive/MyDrive/rag-kb-testdata
+    root: /content/drive/MyDrive/rag-kb-data
 
 # =========================
 # Input
