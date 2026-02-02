@@ -77,11 +77,11 @@ models:
 
 # ---------- Query generation ----------
 query_generation:
-  target_num_queries: 2000
+  target_num_queries: 500
 
   # how to sample chunks for query generation
   sampling:
-    seed: 42
+    seed: 82
     strategy: uniform_random # uniform_random | stratified_by_doc | per_doc_cap
     max_chunks_considered: 6500 # cap if needed
 
