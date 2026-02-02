@@ -7,7 +7,7 @@
 stores:
   fs_local:
     kind: filesystem
-    root: /content/drive/MyDrive/rag-kb-data
+    root: /content/drive/MyDrive/rag-kb-testdata
 
 # ---------- Inputs: ce-pipeline artifacts ----------
 inputs:
