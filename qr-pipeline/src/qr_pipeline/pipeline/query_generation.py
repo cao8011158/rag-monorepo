@@ -161,20 +161,18 @@ def _classify_batch_conservative(
     if n == 0:
         return [], [], None
 
-    try:
-        res = run_query_classification(queries_norm, cfg)
-        in_ids_raw = res.get("in_ids", [])
-        out_ids_raw = res.get("out_ids", [])
-        in_ids, out_ids = _coerce_in_out_ids(in_ids=in_ids_raw, out_ids=out_ids_raw, n=n)
+    res = run_query_classification(queries_norm, cfg)
+    print(res)
+    in_ids_raw = res.get("in_ids", [])
+    out_ids_raw = res.get("out_ids", [])
+    in_ids, out_ids = _coerce_in_out_ids(in_ids=in_ids_raw, out_ids=out_ids_raw, n=n)
 
-        # Missing labels => OUT (implicit). For convenience we can fill out_ids,
-        # but downstream can treat "not IN" as OUT anyway.
-        # We'll keep explicit out_ids as-is.
-        return in_ids, out_ids, None
+    # Missing labels => OUT (implicit). For convenience we can fill out_ids,
+    # but downstream can treat "not IN" as OUT anyway.
+    # We'll keep explicit out_ids as-is.
+    return in_ids, out_ids, None
 
-    except Exception as e:
-        # 解析失败 -> 整批 OUT（保守）
-        return [], list(range(1, n + 1)), f"{type(e).__name__}: {e}"
+
 
 
 # -----------------------------
@@ -395,6 +393,7 @@ def run_query_generation_pipeline(s: Dict[str, Any]) -> Dict[str, Any]:
         # NEW: call your generator (returns List[str])
         try:
             queries = run_query_generation(passage, s)
+            print(queries)
             total_llm_calls_gen += 1
         except Exception as e:
             total_llm_calls_gen += 1
