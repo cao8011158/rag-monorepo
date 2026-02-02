@@ -1,212 +1,355 @@
 # src/ce_pipeline/pipeline/chunking_stage.py
 from __future__ import annotations
 
-from typing import Any, Dict, Iterable, Iterator, Optional, Callable, List, Tuple
-import os
-import traceback
+import argparse
+import hashlib
+from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
-from ce_pipeline.stores.base import Store
+from ce_pipeline.settings import load_settings
 from ce_pipeline.stores.registry import build_store_registry
-from ce_pipeline.io.jsonl import read_jsonl, append_jsonl
-from ce_pipeline.chunking.chunker import chunk_doc
+from ce_pipeline.io.jsonl import read_jsonl, write_jsonl, append_jsonl
 
-# 你已经实现好的 exact dedup（文件路径版）
-from ce_pipeline.processing.exact_dedup import exact_dedup_jsonl_by_hash_meta
+from ce_pipeline.chunking.html_chunker import html_chunker
+from ce_pipeline.chunking.pdf_chunker import pdf_chunker_contextualized_strings
 
-
-def _pjoin(*parts: str) -> str:
-    """Join logical paths using POSIX style."""
-    return "/".join([p.strip("/").replace("\\", "/") for p in parts if p is not None and str(p) != ""])
+from ce_pipeline.embedding.embedder import DualInstructEmbedder
+from ce_pipeline.processing.near_dedup import near_dedup_by_ann_faiss
 
 
-def _default_error_payload(
-    *,
-    stage: str,
-    path: str,
-    line_no: Optional[int] = None,
-    error: str,
-    raw: Optional[str] = None,
-    extra: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
-    payload: Dict[str, Any] = {
-        "stage": stage,
-        "path": path,
-        "error": error,
-    }
-    if line_no is not None:
-        payload["line_no"] = line_no
-    if raw is not None:
-        payload["raw"] = raw
-    if extra:
-        payload.update(extra)
-    return payload
+# --------------------------
+# local helpers
+# --------------------------
+def sha256_hex(s: str) -> str:
+    return hashlib.sha256(s.encode("utf-8", errors="ignore")).hexdigest()
 
 
-def run_chunking_stage(
-    cfg: Dict[str, Any],
-    *,
-    fail_fast: bool = False,
-) -> Dict[str, Any]:
+def utc_now_iso_z() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _chunks_paths(cfg: Dict[str, Any]) -> Tuple[str, str, str, str]:
     """
-    Chunking Stage
-
-    Steps:
-    1) Read cleaned documents.jsonl from input store/path
-    2) For each doc -> chunk_doc(doc, cfg) -> list[ChunkRecord]
-    3) Stream-append all chunks into outputs.chunks.base/chunks.raw.jsonl
-    4) Run exact_dedup on chunks.raw.jsonl -> outputs.chunks.base/chunks.jsonl
-
-    Args:
-        cfg: settings dict loaded from YAML (dynamic dict)
-        fail_fast:
-            - True: any bad JSONL line / bad doc / chunking error raises immediately
-            - False: best-effort; errors are appended into errors.*.jsonl and processing continues
-
     Returns:
-        summary dict: counts and artifact paths
+      out_store_name, base_dir, chunks_path, chunks_dedup_path
     """
+    out_cfg = cfg["outputs"]["chunks"]
+    out_store_name = out_cfg["store"]
+    base = str(out_cfg["base"]).rstrip("/")
+
+    filename = str(out_cfg.get("filename", "chunks.jsonl"))
+    dedup_filename = str(out_cfg.get("dedup_filename", "chunks.dedup.jsonl"))
+
+    chunks_path = f"{base}/{filename}"
+    chunks_dedup_path = f"{base}/{dedup_filename}"
+    return out_store_name, base, chunks_path, chunks_dedup_path
+
+
+def _get_fs_root(cfg: Dict[str, Any], store_name: str) -> Path:
+    """
+    For filesystem store, real root path is cfg["stores"][store_name]["root"].
+    """
+    stores_cfg = cfg.get("stores", {})
+    if store_name not in stores_cfg:
+        raise KeyError(f"Store {store_name!r} not found in cfg['stores'].")
+    root = stores_cfg[store_name].get("root")
+    if not root:
+        raise KeyError(f"Store {store_name!r} missing cfg['stores'][name]['root'].")
+    return Path(root)
+
+
+def _logical_to_real(root: Path, rel_path: str) -> str:
+    return str((root / rel_path).resolve())
+
+
+def _load_existing_chunk_ids(store: Any, chunks_path: str) -> Set[str]:
+    if not store.exists(chunks_path):
+        return set()
+    s: Set[str] = set()
+    for row in read_jsonl(store, chunks_path):
+        cid = row.get("chunk_id")
+        if isinstance(cid, str) and cid:
+            s.add(cid)
+    return s
+
+
+def _format_html_chunk_text(meta: Dict[str, Any], page_content: str) -> str:
+    """
+    meta order is preserved as you confirmed.
+    Returns:
+      "Header 1:Main Title, Header 2:Section 1\n<page_content>"
+    """
+    parts: List[str] = []
+    for k, v in meta.items():
+        if v is None:
+            continue
+        parts.append(f"{k}:{v}")
+    prefix = ", ".join(parts)
+    if prefix:
+        return (prefix + "\n" + (page_content or "")).strip()
+    return (page_content or "").strip()
+
+
+# --------------------------
+# Chunk schema
+# --------------------------
+@dataclass
+class ChunkDoc:
+    chunk_id: str
+    doc_id: str
+    chunk_index: int
+    chunk_text: str
+    chunk_text_hash: str
+
+    url: Optional[str] = None
+    title: Optional[str] = None
+    source: Optional[str] = None
+    content_hash: Optional[str] = None
+    content_type: Optional[str] = None
+    fetched_at: Optional[str] = None
+    run_date: Optional[str] = None
+
+
+def _make_chunk_doc(
+    *,
+    chunk_text: str,
+    doc_id: str,
+    chunk_index: int,
+    url: Optional[str],
+    title: Optional[str],
+    source: Optional[str],
+    content_hash: Optional[str],
+    content_type: Optional[str],
+    fetched_at: Optional[str],
+    run_date: str,
+) -> ChunkDoc:
+    h = sha256_hex(chunk_text)
+    return ChunkDoc(
+        chunk_id=h[:24],
+        doc_id=doc_id,
+        chunk_index=chunk_index,
+        chunk_text=chunk_text,
+        chunk_text_hash=h,
+        url=url,
+        title=title,
+        source=source,
+        content_hash=content_hash,
+        content_type=content_type,
+        fetched_at=fetched_at,
+        run_date=run_date,
+    )
+
+
+def _chunk_one_manifest_doc(
+    *,
+    manifest_row: Dict[str, Any],
+    fs_root: Path,
+    pdf_max_tokens: int,
+    run_date: str,
+) -> List[ChunkDoc]:
+    """
+    Produce doc-internal deduped ChunkDocs for one manifest row, and assign chunk_index 0..n-1.
+    doc_id = url (as you decided)
+    """
+    url = manifest_row.get("url")
+    rel_path = manifest_row.get("rel_path")
+    content_type = manifest_row.get("content_type")
+    content_hash = manifest_row.get("content_hash")
+    fetched_at = manifest_row.get("fetched_at")
+
+    if not isinstance(url, str) or not url:
+        return []
+    if not isinstance(rel_path, str) or not rel_path:
+        return []
+    if not isinstance(content_type, str) or not content_type:
+        return []
+
+    doc_id = url
+    source = rel_path
+    real_path = _logical_to_real(fs_root, rel_path)
+
+    out: List[ChunkDoc] = []
+    seen: Set[str] = set()  # doc-internal exact dedup by chunk_id
+
+    if content_type == "text/html":
+        docs = html_chunker(real_path)  # List[langchain Document]
+        for d in docs:
+            meta = dict(getattr(d, "metadata", {}) or {})
+            title = meta.pop("title", None)
+            page_content = getattr(d, "page_content", "") or ""
+
+            chunk_text = _format_html_chunk_text(meta, page_content)
+            if not chunk_text:
+                continue
+
+            cd = _make_chunk_doc(
+                chunk_text=chunk_text,
+                doc_id=doc_id,
+                chunk_index=0,  # filled later
+                url=url,
+                title=title if isinstance(title, str) else None,
+                source=source,
+                content_hash=content_hash if isinstance(content_hash, str) else None,
+                content_type=content_type,
+                fetched_at=fetched_at if isinstance(fetched_at, str) else None,
+                run_date=run_date,
+            )
+            if cd.chunk_id in seen:
+                continue
+            seen.add(cd.chunk_id)
+            out.append(cd)
+
+    elif content_type == "application/pdf":
+        texts = pdf_chunker_contextualized_strings(real_path, max_tokens=pdf_max_tokens)
+        for t in texts:
+            if not isinstance(t, str):
+                continue
+            chunk_text = t.strip()
+            if not chunk_text:
+                continue
+
+            cd = _make_chunk_doc(
+                chunk_text=chunk_text,
+                doc_id=doc_id,
+                chunk_index=0,  # filled later
+                url=url,
+                title=None,
+                source=source,
+                content_hash=content_hash if isinstance(content_hash, str) else None,
+                content_type=content_type,
+                fetched_at=fetched_at if isinstance(fetched_at, str) else None,
+                run_date=run_date,
+            )
+            if cd.chunk_id in seen:
+                continue
+            seen.add(cd.chunk_id)
+            out.append(cd)
+
+    else:
+        # ignore unknown types
+        return []
+
+    for i, cd in enumerate(out):
+        cd.chunk_index = i
+
+    return out
+
+
+def _semantic_dedup(
+    *,
+    store: Any,
+    chunks_path: str,
+    chunks_dedup_path: str,
+    cfg: Dict[str, Any],
+) -> None:
+    rows = list(read_jsonl(store, chunks_path))
+    if not rows:
+        write_jsonl(store, chunks_dedup_path, [])
+        return
+
+    texts: List[str] = []
+    for r in rows:
+        t = r.get("chunk_text")
+        texts.append(t if isinstance(t, str) else "")
+
+    emb_cfg = cfg["embedding"]
+    inst = emb_cfg.get("instructions", {})
+    embedder = DualInstructEmbedder(
+        model_name=str(emb_cfg["model_name"]),
+        passage_instruction=str(inst["passage"]),
+        query_instruction=str(inst["query"]),
+        batch_size=int(emb_cfg.get("batch_size", 64)),
+        normalize_embeddings=bool(emb_cfg.get("normalize_embeddings", True)),
+        device=emb_cfg.get("device"),
+    )
+
+    emb = embedder.encode_passages(texts)
+
+    sd = cfg["processing"]["dedup"]["semantic_dedup"]
+    res = near_dedup_by_ann_faiss(
+        emb,
+        threshold=float(sd.get("threshold", 0.95)),
+        topk=int(sd.get("topk", 20)),
+        hnsw_m=int(sd.get("hnsw_m", 32)),
+        ef_construction=int(sd.get("ef_construction", 200)),
+        ef_search=int(sd.get("ef_search", 64)),
+        normalize=bool(sd.get("normalize", True)),
+    )
+
+    kept_rows = [rows[i] for i in res.kept_indices]
+    write_jsonl(store, chunks_dedup_path, kept_rows)
+
+
+def run_chunking_stage(config_path: str) -> None:
+    cfg = load_settings(config_path)
     stores = build_store_registry(cfg)
 
-    # ---- input ----
-    in_cfg = cfg["input"]
-    in_store_name: str = in_cfg["input_store"]
-    in_path: str = in_cfg["input_path"]
-    in_store: Store = stores[in_store_name]
+    # input / manifest store
+    in_store_name = cfg["input"]["input_store"]
+    in_store = stores[in_store_name]
 
-    # ---- output (chunks artifact) ----
-    out_cfg = cfg["outputs"]["chunks"]
-    out_store_name: str = out_cfg["store"]
-    out_base: str = out_cfg["base"]
-    out_store: Store = stores[out_store_name]
+    # manifest path (logical)
+    manifest_path = str(cfg["input"]["manifest_path"]).lstrip("/")
 
-    # artifacts under base
-    chunks_raw_rel = _pjoin(out_base, "chunks.raw.jsonl")
-    chunks_final_rel = _pjoin(out_base, "chunks.jsonl")
-    err_docs_rel = _pjoin(out_base, "errors.documents.jsonl")
-    err_chunking_rel = _pjoin(out_base, "errors.chunking.jsonl")
+    # output store + paths
+    out_store_name, _, chunks_path, chunks_dedup_path = _chunks_paths(cfg)
+    out_store = stores[out_store_name]
 
-    # reset outputs (overwrite to empty) so each run is deterministic
-    out_store.write_bytes(chunks_raw_rel, b"")
-    out_store.write_bytes(err_docs_rel, b"")
-    out_store.write_bytes(err_chunking_rel, b"")
+    # fs root for real-path conversion
+    # Your data root is in cfg["stores"]["fs_local"]["root"]
+    fs_root = _get_fs_root(cfg, "fs_local")
 
-    def _log_doc_error(payload: Dict[str, Any]) -> None:
-        append_jsonl(out_store, err_docs_rel, [payload])
+    # knobs
+    pdf_max_tokens = int(cfg.get("chunking", {}).get("pdf_max_tokens", 256))
+    run_date = utc_now_iso_z()
 
-    def _log_chunking_error(payload: Dict[str, Any]) -> None:
-        append_jsonl(out_store, err_chunking_rel, [payload])
+    # global exact dedup based on existing chunks.jsonl
+    existing_chunk_ids = _load_existing_chunk_ids(out_store, chunks_path)
 
-    # ---- read documents.jsonl ----
-    on_read_error: Optional[Callable[[Dict[str, Any]], None]]
-    if fail_fast:
-        on_read_error = None
-    else:
-        # read_jsonl 的 on_error payload 结构由你 IO 文档定义
-        def _on_read_error(payload: Dict[str, Any]) -> None:
-            _log_doc_error(payload)
-        on_read_error = _on_read_error
-
-    docs_iter = read_jsonl(in_store, in_path, on_error=on_read_error)
-
-    docs_total = 0
-    docs_ok = 0
-    chunks_total = 0
-    docs_skipped = 0
-    chunk_errors = 0
-
-    # ---- chunking loop (streaming append) ----
-    for doc in docs_iter:
-        docs_total += 1
-
-        # 基础“坏文档”策略：缺字段直接跳过（或 fail-fast）
-        doc_id = str(doc.get("doc_id", "") or "")
-        text = doc.get("text", None)
-
-        if not doc_id or not isinstance(text, str) or not text.strip():
-            if fail_fast:
-                raise ValueError(f"Bad document record: doc_id/text invalid (doc_id={doc_id!r})")
-            docs_skipped += 1
-            _log_chunking_error(
-                _default_error_payload(
-                    stage="chunking_stage.validate_doc",
-                    path=in_path,
-                    error="Bad document record: missing/invalid doc_id or text",
-                    extra={"doc_id": doc_id, "has_text": isinstance(text, str)},
-                )
-            )
-            continue
-
-        try:
-            chunks: List[Dict[str, Any]] = chunk_doc(doc, cfg)
-            if chunks:
-                append_jsonl(out_store, chunks_raw_rel, chunks)
-                chunks_total += len(chunks)
-            docs_ok += 1
-        except Exception as e:
-            if fail_fast:
-                raise
-            chunk_errors += 1
-            _log_chunking_error(
-                _default_error_payload(
-                    stage="chunking_stage.chunk_doc",
-                    path=in_path,
-                    error=f"{type(e).__name__}: {e}",
-                    extra={
-                        "doc_id": doc_id,
-                        "traceback": traceback.format_exc(limit=20),
-                    },
-                )
-            )
-            continue
-
-    # ---- exact dedup (reuse your existing exact_dedup.py) ----
-    # 注意：你的 exact_dedup_jsonl_by_hash_meta 只接受“文件系统路径”
-    # 所以这里要求 out_store 是 filesystem store（root 能映射到本地路径）
-    # 我们通过常见字段/root 的方式尽量适配；不行就报错提示。
-    out_root = getattr(out_store, "root", None)  # FilesystemStore(root=Path("."))
-    if out_root is None:
-        raise NotImplementedError(
-            "exact_dedup_jsonl_by_hash_meta requires a filesystem-backed store "
-            "(out_store should expose .root). For non-filesystem stores, implement a Store-based dedup stage."
+    # stream append
+    buffer: List[Dict[str, Any]] = []
+    for m in read_jsonl(in_store, manifest_path):
+        chunk_docs = _chunk_one_manifest_doc(
+            manifest_row=m,
+            fs_root=fs_root,
+            pdf_max_tokens=pdf_max_tokens,
+            run_date=run_date,
         )
+        for cd in chunk_docs:
+            if cd.chunk_id in existing_chunk_ids:
+                continue
+            existing_chunk_ids.add(cd.chunk_id)
+            buffer.append(asdict(cd))
 
-    # 把 logical path 转为本地路径：root + logical_rel
-    # root 可能是 pathlib.Path
-    root_str = str(out_root)
-    raw_fs_path = os.path.abspath(os.path.join(root_str, chunks_raw_rel))
-    final_fs_path = os.path.abspath(os.path.join(root_str, chunks_final_rel))
+        if len(buffer) >= 2000:
+            append_jsonl(out_store, chunks_path, buffer)
+            buffer = []
 
-    hash_field = (
-        cfg.get("processing", {})
-          .get("dedup", {})
-          .get("exact_dedup", {})
-          .get("hash_field", "chunk_text_hash")
-    )
+    if buffer:
+        append_jsonl(out_store, chunks_path, buffer)
 
-    kept = exact_dedup_jsonl_by_hash_meta(
-        raw_fs_path,
-        final_fs_path,
-        hash_field=hash_field,
-        encoding="utf-8",
-    )
+    # semantic dedup
+    sd = cfg["processing"]["dedup"]["semantic_dedup"]
+    if bool(sd.get("enable", False)):
+        _semantic_dedup(
+            store=out_store,
+            chunks_path=chunks_path,
+            chunks_dedup_path=chunks_dedup_path,
+            cfg=cfg,
+        )
+    else:
+        # still write a dedup file for determinism
+        write_jsonl(out_store, chunks_dedup_path, read_jsonl(out_store, chunks_path))
 
-    return {
-        "input": {"store": in_store_name, "path": in_path},
-        "output": {
-            "store": out_store_name,
-            "base": out_base,
-            "chunks_raw": chunks_raw_rel,
-            "chunks_final": chunks_final_rel,
-            "errors_documents": err_docs_rel,
-            "errors_chunking": err_chunking_rel,
-        },
-        "counts": {
-            "docs_total": docs_total,
-            "docs_ok": docs_ok,
-            "docs_skipped": docs_skipped,
-            "chunk_errors": chunk_errors,
-            "chunks_total_raw": chunks_total,
-            "chunks_kept_after_exact_dedup": kept,
-        },
-        "dedup": {"hash_field": hash_field},
-    }
+
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--config", type=str, default="configs/pipeline.yaml")
+    args = ap.parse_args()
+    run_chunking_stage(args.config)
+
+
+if __name__ == "__main__":
+    main()

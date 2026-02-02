@@ -12,6 +12,7 @@ stores:
 input:
   input_store: fs_local
   input_path: cleaned/documents.jsonl
+  manifest_path: manifests/latest.jsonl
 
 # =========================
 # Outputs
@@ -20,6 +21,8 @@ outputs:
   chunks:
     store: fs_local
     base: ce_out/chunks
+    filename: chunks.jsonl
+    dedup_filename: chunks.dedup.jsonl
 
   vector_index:
     store: fs_local
@@ -36,6 +39,7 @@ chunking:
   window_chars: 1000
   overlap_chars: 120
   min_chunk_chars: 400
+  pdf_max_tokens: 256
 
 # =========================
 # Processing (Deduplication)
