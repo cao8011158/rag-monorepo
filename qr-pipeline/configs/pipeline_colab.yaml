@@ -67,7 +67,7 @@ models:
   #embedder for dense retrieval queries (only if rq-pipeline needs to embed queries)
   embedding:
     model_name: "intfloat/e5-base-v2"
-    device: cuda # "cpu" / "cuda" / None(auto)
+    device: cpu # "cpu" / "cuda" / None(auto)
     batch_size: 64
     cache_dir: /content/drive/MyDrive/rag-kb-data/data/.hf_cache
     normalize_embeddings: true
