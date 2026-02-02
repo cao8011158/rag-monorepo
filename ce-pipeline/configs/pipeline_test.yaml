@@ -36,7 +36,7 @@ outputs:
 # Chunking
 # =========================
 chunking:
-  window_chars: 1000
+  window_chars: 1200
   overlap_chars: 120
   min_chunk_chars: 400
   pdf_max_tokens: 256

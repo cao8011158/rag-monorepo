@@ -29,7 +29,7 @@ def run_pipeline(
     # -------------------------
     # 1) Chunking
     # -------------------------
-    chunk_res = run_chunking_stage(cfg, fail_fast=fail_fast)
+    run_chunking_stage(cfg)
 
     # -------------------------
     # 2) Embedding
