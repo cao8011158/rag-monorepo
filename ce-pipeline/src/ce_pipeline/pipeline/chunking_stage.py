@@ -198,6 +198,12 @@ def _chunk_one_manifest_doc(
             )
             if cd.chunk_id in seen:
                 continue
+
+            title_text = title if isinstance(title, str) else ""
+            full_text = (title_text + "\n" + chunk_text).strip()
+
+            if len(full_text) < 250:
+                continue
             seen.add(cd.chunk_id)
             out.append(cd)
 
@@ -223,6 +229,9 @@ def _chunk_one_manifest_doc(
                 run_date=run_date,
             )
             if cd.chunk_id in seen:
+                continue
+            
+            if len(chunk_text) < 250:
                 continue
             seen.add(cd.chunk_id)
             out.append(cd)
