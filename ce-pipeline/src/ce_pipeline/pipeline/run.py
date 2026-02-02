@@ -2,27 +2,20 @@
 from __future__ import annotations
 
 from typing import Any, Dict
+import argparse
 import json
 
-from ce_pipeline.pipeline.chunking_stage import run_chunking_stage
 from ce_pipeline.pipeline.embedding_stage import run_embedding_stage, EmbeddingStageResult
 from ce_pipeline.pipeline.indexing_stage import run_indexing_stage
 from ce_pipeline.stores.registry import build_store_registry
+from ce_pipeline.settings import load_settings
 
 
-def run_pipeline(
-    cfg: Dict[str, Any],
-    *,
-    fail_fast: bool = False,
-    best_effort_indexing: bool = True,
-    run_bm25: bool = True,
-) -> Dict[str, Any]:
+def run_pipeline(cfg: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Orchestrate embedding and indexing pipeline in order:
-      2) embedding_stage
-      3) indexing_stage (bm25, optional)
-
-    Returns a summary dict for logging / CLI / CI.
+    Orchestrate pipeline:
+      1) embedding_stage
+      2) indexing_stage (bm25 + vector)
     """
 
     # -------------------------
@@ -39,7 +32,7 @@ def run_pipeline(
         vec_out = cfg["outputs"]["vector_index"]
         vec_store = stores[vec_out["store"]]
 
-        meta_path = emb_res.meta_path  # e.g. ce_out/indexes/vector/meta.json
+        meta_path = emb_res.meta_path
         if vec_store.exists(meta_path):
             raw = vec_store.read_bytes(meta_path)
             meta = json.loads(raw.decode("utf-8"))
@@ -50,11 +43,9 @@ def run_pipeline(
         semantic_dedup_info = {"error": f"Failed to read meta.json: {e}"}
 
     # -------------------------
-    # 2) BM25 (optional)
+    # 2) Indexing (BM25 / vector)
     # -------------------------
-    bm25_res = None
-    if run_bm25:
-        bm25_res = run_indexing_stage(cfg, best_effort=best_effort_indexing)
+    bm25_res = run_indexing_stage(cfg)
 
     # -------------------------
     # Summary
@@ -74,3 +65,28 @@ def run_pipeline(
         },
         "bm25": bm25_res,
     }
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Run ce_pipeline embedding + indexing pipeline"
+    )
+    parser.add_argument(
+        "--config",
+        "-c",
+        required=True,
+        help="Path to pipeline config yaml",
+    )
+
+    args = parser.parse_args()
+
+    # ✅ 使用你项目的 settings 系统
+    cfg = load_settings(args.config)
+
+    summary = run_pipeline(cfg)
+
+    print(json.dumps(summary, ensure_ascii=False, indent=2))
+
+
+if __name__ == "__main__":
+    main()
