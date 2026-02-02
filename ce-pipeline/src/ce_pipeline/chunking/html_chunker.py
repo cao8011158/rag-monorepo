@@ -35,7 +35,7 @@ def html_chunker(html_real_path: Union[str, Path]) -> List[Document]:
             ("h2", "Header 2"),
         ],
         separators=["\n\n", "\n", ".", "!", "?", " "],
-        max_chunk_size=500,
+        max_chunk_size=1000,
         preserve_images=True,
         preserve_videos=True,
         elements_to_preserve=["table", "ul", "ol", "code"],

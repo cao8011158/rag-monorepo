@@ -18,8 +18,7 @@ def run_pipeline(
     run_bm25: bool = True,
 ) -> Dict[str, Any]:
     """
-    Orchestrate full pipeline in order:
-      1) chunking_stage
+    Orchestrate embedding and indexing pipeline in order:
       2) embedding_stage
       3) indexing_stage (bm25, optional)
 
@@ -27,12 +26,7 @@ def run_pipeline(
     """
 
     # -------------------------
-    # 1) Chunking
-    # -------------------------
-    run_chunking_stage(cfg)
-
-    # -------------------------
-    # 2) Embedding
+    # 1) Embedding
     # -------------------------
     emb_res: EmbeddingStageResult = run_embedding_stage(cfg)
 
@@ -56,7 +50,7 @@ def run_pipeline(
         semantic_dedup_info = {"error": f"Failed to read meta.json: {e}"}
 
     # -------------------------
-    # 3) BM25 (optional)
+    # 2) BM25 (optional)
     # -------------------------
     bm25_res = None
     if run_bm25:
@@ -66,7 +60,6 @@ def run_pipeline(
     # Summary
     # -------------------------
     return {
-        "chunking": chunk_res,
         "embedding": {
             "vector_base": emb_res.vector_base,
             "chunks_path": emb_res.chunks_path,
