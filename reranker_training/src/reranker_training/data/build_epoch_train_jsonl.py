@@ -69,7 +69,6 @@ def build_epoch_pairs(
     chunk_map: Dict[str, Dict[str, Any]],
     epoch: int,
     seed: int,
-    hard_negative_per_positive: int,
     random_negative_per_positive: int,
     fail_fast: bool,
     random_neg_max_tries: int = 50,
@@ -138,7 +137,7 @@ def build_epoch_pairs(
             hard_k = 1
             allow_repeat = True
         else:
-            hard_k = min(hard_negative_per_positive, h_n // p_cnt)
+            hard_k = h_n // p_cnt
             allow_repeat = False
 
         # For each positive, generate (q, d+, d-)
@@ -298,7 +297,6 @@ def main() -> None:
     train_cfg = s["training"]
     num_epochs = int(train_cfg["num_epochs"])
     seed = int(train_cfg["seed"])
-    hard_negative_per_positive = int(train_cfg["hard_negative_per_positive"])
     random_negative_per_positive = int(train_cfg["random_negative_per_positive"])
 
     print("Loading query packs...")
@@ -323,7 +321,6 @@ def main() -> None:
             chunk_map=chunk_map,
             epoch=epoch,
             seed=seed,
-            hard_negative_per_positive=hard_negative_per_positive,
             random_negative_per_positive=random_negative_per_positive,
             fail_fast=fail_fast,
             random_neg_max_tries=50,

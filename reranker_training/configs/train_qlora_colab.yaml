@@ -42,7 +42,6 @@ Training:
   num_epochs: 3
   # Pairwise sampling
   # Re-sample hard negatives each epoch:
-  hard_negative_per_positive: 4
   random_negative_per_positive: 1
   random_neg_ratio: 0.25
 
