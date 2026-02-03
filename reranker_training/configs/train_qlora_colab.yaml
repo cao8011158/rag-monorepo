@@ -27,7 +27,7 @@ outputs:
     base: reranker_out
     train_path: "processed/train_query_pack.jsonl"
     valid_path: "processed/valid_query_pack.jsonl"
-    train_pair_path: "processed/train_pair_epoch_n.jsonl"
+    train_pair_path: "processed/train_pair_epoch_{epoch}.jsonl"
 
 # Tokenization
 max_length: 512
@@ -35,9 +35,9 @@ max_length: 512
 pair_format: "query_doc"
 data_split: 0.85
 
-Training:
-  Optimizer: AdamW
-  output_dir: "content/drive/MyDrive/rag-kb-data/run1"
+training:
+  optimizer: AdamW
+  output_dir: /content/drive/MyDrive/rag-kb-data/run1
   seed: 42
   num_epochs: 3
   # Pairwise sampling
@@ -64,7 +64,7 @@ lora:
   alpha: 32
   dropout: 0.05
   # typical target modules for transformer blocks:
-  target_modules: ["q_proj", "k_proj", "v_proj", "o_proj"]
+  target_modules: ["query", "key", "value", "dense"]
 
 # Precision
 bf16: true

@@ -1,5 +1,5 @@
 # src/rq_pipeline/settings.py
-from __future__ import annotations 
+from __future__ import annotations
 
 from pathlib import Path
 from typing import Any, Dict, Optional, Set
@@ -44,19 +44,32 @@ def apply_defaults(raw: SettingsDict) -> SettingsDict:
     """
     Apply defaults to raw YAML, ensuring required nested objects exist.
 
-    This version matches the NEW reranker-training config schema:
+    This version matches the config schema you provided:
 
-    - model_name: str
-    - stores: {<name>: {kind, root, ...}}
-    - inputs:
-        pairs: {store, base, pairs}
-        chunks: {store, base, chunks_file}
-    - outputs:
-        files: {store, base, train_path, valid_path, train_pair_path}
-    - max_length, pair_format, data_split
-    - training: {Optimizer, output_dir, seed, num_epochs, ...}
-    - lora: {enabled, qlora_4bit, r, alpha, dropout, target_modules}
-    - bf16, fp16, num_workers
+    model_name: str
+
+    stores: {<name>: {kind, root, ...}}
+
+    inputs:
+      pairs:  {store, base, pairs}
+      chunks: {store, base, chunks_file}
+
+    outputs:
+      files: {store, base, train_path, valid_path, train_pair_path}
+
+    max_length, pair_format, data_split
+
+    training:
+      optimizer, output_dir, seed, num_epochs,
+      hard_negative_per_positive, random_negative_per_positive, random_neg_ratio,
+      lr, weight_decay, warmup_ratio,
+      per_device_train_batch_size, per_device_eval_batch_size, grad_accum_steps,
+      log_every_steps, eval_every_steps, save_every_steps, max_steps
+
+    lora:
+      enabled, qlora_4bit, r, alpha, dropout, target_modules
+
+    bf16, fp16, num_workers
     """
     s: SettingsDict = _deep_copy_dict(raw)
 
@@ -94,11 +107,9 @@ def apply_defaults(raw: SettingsDict) -> SettingsDict:
     of = s["outputs"]["files"]
     of.setdefault("store", "")
     of.setdefault("base", "")
-
-    # file paths under outputs.files.base
     of.setdefault("train_path", "processed/train_query_pack.jsonl")
     of.setdefault("valid_path", "processed/valid_query_pack.jsonl")
-    of.setdefault("train_pair_path", "processed/train_pair_epoch_n.jsonl")
+    of.setdefault("train_pair_path", "processed/train_pair_epoch_{epoch}.jsonl")
 
     # ---- tokenization / format / split ----
     s.setdefault("max_length", 512)
@@ -109,13 +120,15 @@ def apply_defaults(raw: SettingsDict) -> SettingsDict:
     s.setdefault("training", {})
     _must_be_mapping(s["training"], "training")
     tr = s["training"]
-    tr.setdefault("Optimizer", "AdamW")
+
+    # NOTE: config uses lowercase "optimizer"
+    tr.setdefault("optimizer", "AdamW")
     tr.setdefault("output_dir", "")
     tr.setdefault("seed", 42)
     tr.setdefault("num_epochs", 1)
 
-    # sampling knobs
-    tr.setdefault("hard_negative_per_positive", 4)
+    # sampling knobs (allow missing in YAML)
+    tr.setdefault("hard_negative_per_positive", 0)
     tr.setdefault("random_negative_per_positive", 1)
     tr.setdefault("random_neg_ratio", 0.0)
 
@@ -143,7 +156,7 @@ def apply_defaults(raw: SettingsDict) -> SettingsDict:
     lora.setdefault("r", 16)
     lora.setdefault("alpha", 32)
     lora.setdefault("dropout", 0.05)
-    lora.setdefault("target_modules", ["q_proj", "k_proj", "v_proj", "o_proj"])
+    lora.setdefault("target_modules", ["query", "key", "value", "dense"])
 
     # ---- precision ----
     s.setdefault("bf16", False)
@@ -168,44 +181,49 @@ def validate_settings(s: SettingsDict) -> None:
         raise ValueError("stores is required")
     _must_be_mapping(s["stores"], "stores")
 
-    # validate each store minimal schema
     for name, cfg in s["stores"].items():
         if not isinstance(cfg, dict):
             raise ValueError(f"stores.{name} must be a mapping (YAML dict)")
         _require_nonempty_str(cfg.get("kind"), f"stores.{name}.kind")
-        # filesystem store requires root
         if str(cfg.get("kind")) == "filesystem":
             _require_nonempty_str(cfg.get("root"), f"stores.{name}.root")
 
     # ---- inputs ----
-    inp = s["inputs"]
+    inp = s.get("inputs")
     if not isinstance(inp, dict):
         raise ValueError("inputs must be a mapping (YAML dict)")
 
-    ip = inp["pairs"]
+    ip = inp.get("pairs")
+    if not isinstance(ip, dict):
+        raise ValueError("inputs.pairs must be a mapping (YAML dict)")
     _require_nonempty_str(ip.get("store"), "inputs.pairs.store")
     _require_nonempty_str(ip.get("base"), "inputs.pairs.base")
     _require_nonempty_str(ip.get("pairs"), "inputs.pairs.pairs")
 
-    ic = inp["chunks"]
+    ic = inp.get("chunks")
+    if not isinstance(ic, dict):
+        raise ValueError("inputs.chunks must be a mapping (YAML dict)")
     _require_nonempty_str(ic.get("store"), "inputs.chunks.store")
     _require_nonempty_str(ic.get("base"), "inputs.chunks.base")
     _require_nonempty_str(ic.get("chunks_file"), "inputs.chunks.chunks_file")
 
     # ---- outputs ----
-    out = s["outputs"]
+    out = s.get("outputs")
     if not isinstance(out, dict):
         raise ValueError("outputs must be a mapping (YAML dict)")
 
     of = out.get("files")
     if not isinstance(of, dict):
         raise ValueError("outputs.files must be a mapping (YAML dict)")
-
     _require_nonempty_str(of.get("store"), "outputs.files.store")
     _require_nonempty_str(of.get("base"), "outputs.files.base")
     _require_nonempty_str(of.get("train_path"), "outputs.files.train_path")
     _require_nonempty_str(of.get("valid_path"), "outputs.files.valid_path")
-    _require_nonempty_str(of.get("train_pair_path"), "outputs.files.train_pair_path")
+    tpp = _require_nonempty_str(of.get("train_pair_path"), "outputs.files.train_pair_path")
+
+    # optional but helpful: ensure epoch placeholder exists so training can format path
+    if "{epoch}" not in tpp:
+        raise ValueError("outputs.files.train_pair_path must contain '{epoch}' placeholder")
 
     # ---- tokenization / format / split ----
     _as_int(s.get("max_length"), "max_length", min_value=8)
@@ -215,9 +233,9 @@ def validate_settings(s: SettingsDict) -> None:
         raise ValueError(f"data_split must be in (0,1), got {split}")
 
     # ---- training ----
-    tr = s["training"]
+    tr = s.get("training")
     _must_be_mapping(tr, "training")
-    _require_nonempty_str(tr.get("Optimizer"), "training.Optimizer")
+    _require_nonempty_str(tr.get("optimizer"), "training.optimizer")
     _require_nonempty_str(tr.get("output_dir"), "training.output_dir")
     _as_int(tr.get("seed"), "training.seed")
     _as_int(tr.get("num_epochs"), "training.num_epochs", min_value=1)
@@ -242,7 +260,7 @@ def validate_settings(s: SettingsDict) -> None:
         _as_int(tr.get("max_steps"), "training.max_steps", min_value=1)
 
     # ---- lora ----
-    lora = s["lora"]
+    lora = s.get("lora")
     _must_be_mapping(lora, "lora")
     if not isinstance(lora.get("enabled"), bool):
         raise ValueError("lora.enabled must be boolean")
@@ -313,7 +331,13 @@ def _validate_enum(v: str, allowed: Set[str], path: str) -> None:
         raise ValueError(f"{path} must be one of {sorted(allowed)}, got {v!r}")
 
 
-def _as_int(v: Any, path: str, *, min_value: Optional[int] = None, max_value: Optional[int] = None) -> int:
+def _as_int(
+    v: Any,
+    path: str,
+    *,
+    min_value: Optional[int] = None,
+    max_value: Optional[int] = None,
+) -> int:
     try:
         x = int(v)
     except Exception as e:
@@ -325,7 +349,13 @@ def _as_int(v: Any, path: str, *, min_value: Optional[int] = None, max_value: Op
     return x
 
 
-def _as_float(v: Any, path: str, *, min_value: Optional[float] = None, max_value: Optional[float] = None) -> float:
+def _as_float(
+    v: Any,
+    path: str,
+    *,
+    min_value: Optional[float] = None,
+    max_value: Optional[float] = None,
+) -> float:
     try:
         x = float(v)
     except Exception as e:
