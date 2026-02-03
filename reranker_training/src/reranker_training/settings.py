@@ -233,7 +233,7 @@ def validate_settings(s: SettingsDict) -> None:
         raise ValueError(f"data_split must be in (0,1), got {split}")
 
     # ---- training ----
-    tr = s.get("training")
+    tr = s["training"]
     _must_be_mapping(tr, "training")
     _require_nonempty_str(tr.get("optimizer"), "training.optimizer")
     _require_nonempty_str(tr.get("output_dir"), "training.output_dir")
@@ -260,7 +260,7 @@ def validate_settings(s: SettingsDict) -> None:
         _as_int(tr.get("max_steps"), "training.max_steps", min_value=1)
 
     # ---- lora ----
-    lora = s.get("lora")
+    lora = s["lora"]
     _must_be_mapping(lora, "lora")
     if not isinstance(lora.get("enabled"), bool):
         raise ValueError("lora.enabled must be boolean")
