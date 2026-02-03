@@ -94,4 +94,4 @@ python -m qr_pipeline.cli run --config configs/pipeline.yaml
 如果你确实配了 console script（比如 qr），那么就是：
 
 qr-qg --config configs/pipeline.yaml
-pair-pair --config configs/pipeline.yaml
+qr-pair --config configs/pipeline.yaml
