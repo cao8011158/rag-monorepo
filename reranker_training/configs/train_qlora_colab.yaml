@@ -14,7 +14,7 @@ inputs:
   pairs:
     store: fs_local
     base: rq_out/pairs
-    pairs: query_pack.jsonl
+    pairs: query_packs.jsonl
 
   chunks:
     store: fs_local
