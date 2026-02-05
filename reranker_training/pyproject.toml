@@ -9,6 +9,7 @@ description = "Cross-encoder reranker LoRA/QLoRA training scaffold."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
+
 dependencies = [
   "pyyaml>=6.0.1",
   "orjson>=3.10.0",
@@ -20,8 +21,6 @@ dependencies = [
   "datasets>=2.19.0",
   "accelerate>=0.33.0",
   "peft>=0.12.0",
-  "bitsandbytes>=0.43.0",
-  "peft>=0.11.0",
 ]
 
 [project.optional-dependencies]
@@ -29,9 +28,18 @@ dev = [
   "pytest>=8.0.0",
   "ruff>=0.6.0",
 ]
+qlora = [
+  "bitsandbytes>=0.43.0",
+]
+
+[project.scripts]
+reranker-t = "reranker_training.train_reranker:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
 
 [tool.ruff]
 line-length = 110

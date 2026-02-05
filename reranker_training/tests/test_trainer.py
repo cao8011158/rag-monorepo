@@ -230,7 +230,7 @@ def test_pairwise_trainer_compute_loss_decreases_when_pos_better(tmp_path):
         args=tr_args,
         train_dataset=None,
         eval_dataset=None,
-        tokenizer=None,
+        processing_class=None,
         data_collator=None,
     )
 
@@ -284,7 +284,7 @@ def test_pairwise_trainer_with_ranking_eval_prefix_and_log_called(monkeypatch, t
         args=tr_args,
         train_dataset=None,
         eval_dataset=None,
-        tokenizer=tok,
+        processing_class=tok,
         data_collator=None,
         valid_packs=packs,
         max_length=16,

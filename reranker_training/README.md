@@ -72,8 +72,8 @@ score(query, positive) > score(query, negative)
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -e .
-python -m reranker_training.train --config configs/train_qlora.yaml
-python -m reranker_training.data.build_valid_split --config configs/train_qlora.yaml
+python -m reranker_training.train_reranker --config configs/train_qlora.yaml
+reranker-t --config configs/train_qlora.yaml
 ```
 
 ---

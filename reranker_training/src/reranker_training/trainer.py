@@ -224,7 +224,7 @@ class PairwiseTrainerWithRankingEval(PairwiseTrainer):
         metrics = evaluate_ranking(
             packs=self.valid_packs,
             model=self.model,
-            tokenizer=self.tokenizer,
+            tokenizer=self.processing_class,
             max_length=self.eval_max_length,
             device=device,
             ndcg_k=self.ndcg_k,

@@ -198,7 +198,7 @@ def main() -> None:
         per_device_eval_batch_size=bsz_eval,
         gradient_accumulation_steps=grad_accum,
         logging_steps=log_steps,
-        evaluation_strategy="steps",
+        eval_strategy="steps",
         eval_steps=eval_steps,
         save_strategy="steps",
         save_steps=save_steps,
@@ -257,7 +257,7 @@ def main() -> None:
         train_dataset=train_ds,
         eval_dataset=train_ds,  # not used; evaluate() overridden
         data_collator=collator,
-        tokenizer=tokenizer,
+        processing_class=tokenizer,
         valid_packs=valid_packs,
         max_length=max_length,
         ndcg_k=ndcg_k,
