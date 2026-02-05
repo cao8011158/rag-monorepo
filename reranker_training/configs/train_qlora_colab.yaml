@@ -2,6 +2,7 @@
 # Example (you choose one):
 # - BAAI/bge-reranker-v2-m3
 # - mixedbread-ai/mxbai-rerank-large-v1 (example name, use what you actually download)
+
 model_name: "BAAI/bge-reranker-v2-m3"
 
 stores:
@@ -48,18 +49,29 @@ training:
   lr: 2.0e-5
   weight_decay: 0.01
   warmup_ratio: 0.05
+
   per_device_train_batch_size: 8
-  per_device_eval_batch_size: 16
+  per_device_eval_batch_size: 20
   grad_accum_steps: 2
+
   log_every_steps: 20
   eval_every_steps: 200
   save_every_steps: 200
+
   max_steps: null # set integer to cap training
+
+# Evaluation
+
+eval:
+  ndcg_k: 10
+  mrr_k: 10
+  infer_batch_size: 32
+  max_negatives_per_query: 50
 
 # QLoRA / LoRA
 lora:
   enabled: true
-  qlora_4bit: true
+  qlora_4bit: false
   r: 16
   alpha: 32
   dropout: 0.05

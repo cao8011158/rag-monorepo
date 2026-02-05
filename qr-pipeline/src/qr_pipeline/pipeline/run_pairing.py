@@ -18,6 +18,8 @@ from qr_pipeline.stores.registry import build_store_registry
 from qr_pipeline.llm.pairing import build_pairs_for_query
 
 
+
+
 # -----------------------------
 # Types (match pairing API)
 # -----------------------------

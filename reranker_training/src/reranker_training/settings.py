@@ -66,6 +66,9 @@ def apply_defaults(raw: SettingsDict) -> SettingsDict:
       per_device_train_batch_size, per_device_eval_batch_size, grad_accum_steps,
       log_every_steps, eval_every_steps, save_every_steps, max_steps
 
+    eval:
+      ndcg_k, mrr_k, infer_batch_size, max_negatives_per_query
+
     lora:
       enabled, qlora_4bit, r, alpha, dropout, target_modules
 
@@ -89,7 +92,8 @@ def apply_defaults(raw: SettingsDict) -> SettingsDict:
     ip = s["inputs"]["pairs"]
     ip.setdefault("store", "")
     ip.setdefault("base", "")
-    ip.setdefault("pairs", "query_pack.jsonl")
+    # ✅ match your YAML: query_packs.jsonl (plural)
+    ip.setdefault("pairs", "query_packs.jsonl")
 
     s["inputs"].setdefault("chunks", {})
     _must_be_mapping(s["inputs"]["chunks"], "inputs.chunks")
@@ -121,13 +125,12 @@ def apply_defaults(raw: SettingsDict) -> SettingsDict:
     _must_be_mapping(s["training"], "training")
     tr = s["training"]
 
-    # NOTE: config uses lowercase "optimizer"
     tr.setdefault("optimizer", "AdamW")
     tr.setdefault("output_dir", "")
     tr.setdefault("seed", 42)
     tr.setdefault("num_epochs", 1)
 
-    # sampling knobs (allow missing in YAML)
+    # sampling knobs
     tr.setdefault("hard_negative_per_positive", 0)
     tr.setdefault("random_negative_per_positive", 1)
     tr.setdefault("random_neg_ratio", 0.0)
@@ -145,7 +148,16 @@ def apply_defaults(raw: SettingsDict) -> SettingsDict:
     tr.setdefault("log_every_steps", 50)
     tr.setdefault("eval_every_steps", 200)
     tr.setdefault("save_every_steps", 200)
-    tr.setdefault("max_steps", None)  # optional int cap
+    tr.setdefault("max_steps", None)
+
+    # ---- eval ----
+    s.setdefault("eval", {})
+    _must_be_mapping(s["eval"], "eval")
+    ev = s["eval"]
+    ev.setdefault("ndcg_k", 10)
+    ev.setdefault("mrr_k", 10)
+    ev.setdefault("infer_batch_size", 32)
+    ev.setdefault("max_negatives_per_query", 50)
 
     # ---- lora ----
     s.setdefault("lora", {})
@@ -221,7 +233,6 @@ def validate_settings(s: SettingsDict) -> None:
     _require_nonempty_str(of.get("valid_path"), "outputs.files.valid_path")
     tpp = _require_nonempty_str(of.get("train_pair_path"), "outputs.files.train_pair_path")
 
-    # optional but helpful: ensure epoch placeholder exists so training can format path
     if "{epoch}" not in tpp:
         raise ValueError("outputs.files.train_pair_path must contain '{epoch}' placeholder")
 
@@ -258,6 +269,15 @@ def validate_settings(s: SettingsDict) -> None:
 
     if tr.get("max_steps") is not None:
         _as_int(tr.get("max_steps"), "training.max_steps", min_value=1)
+
+    # ---- eval ----
+    ev = s.get("eval")
+    if not isinstance(ev, dict):
+        raise ValueError("eval must be a mapping (YAML dict)")
+    _as_int(ev.get("ndcg_k"), "eval.ndcg_k", min_value=1)
+    _as_int(ev.get("mrr_k"), "eval.mrr_k", min_value=1)
+    _as_int(ev.get("infer_batch_size"), "eval.infer_batch_size", min_value=1)
+    _as_int(ev.get("max_negatives_per_query"), "eval.max_negatives_per_query", min_value=1)
 
     # ---- lora ----
     lora = s["lora"]
