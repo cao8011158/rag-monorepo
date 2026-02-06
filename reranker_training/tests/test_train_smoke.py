@@ -177,6 +177,7 @@ def test_train_smoke_two_steps_with_eval_transformers5(tmp_path: Path) -> None:
         model=model,
         args=args,
         train_dataset=train_ds,
+        eval_dataset=train_ds,
         data_collator=collator,
         processing_class=tok,
         valid_packs=valid_packs,
