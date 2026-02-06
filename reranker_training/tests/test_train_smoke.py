@@ -136,7 +136,11 @@ def test_train_smoke_two_steps_with_eval_transformers5(tmp_path: Path) -> None:
     # -----------------------------
     model_name = "hf-internal-testing/tiny-random-bert"
     tok = AutoTokenizer.from_pretrained(model_name)
-    base_model = AutoModelForSequenceClassification.from_pretrained(model_name, num_labels=1)
+    base_model = AutoModelForSequenceClassification.from_pretrained(
+            model_name,
+            num_labels=1,
+            ignore_mismatched_sizes=True,   # ⭐⭐⭐ 关键新增
+    )
     model = CrossEncoderReranker(base_model)
 
     # -----------------------------
