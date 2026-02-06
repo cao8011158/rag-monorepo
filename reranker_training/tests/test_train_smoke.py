@@ -19,7 +19,7 @@ from reranker_training.trainer import PairwiseTrainerWithRankingEval
 
 
 # -----------------------------
-# Minimal EvalPack (match what your ranking eval expects)
+# Minimal EvalPack (only if your project doesn't already export it)
 # -----------------------------
 @dataclass
 class EvalPack:
@@ -28,30 +28,41 @@ class EvalPack:
     labels: List[int]
 
 
-def _write_jsonl(path: Path, rows: List[Dict[str, Any]]) -> None:
+# -----------------------------
+# Local filesystem Store adapter matching YOUR io/jsonl.py
+# Requires: read_bytes / write_bytes / exists
+# -----------------------------
+class LocalStore:
+    def read_bytes(self, path: str) -> bytes:
+        return Path(path).read_bytes()
+
+    def write_bytes(self, path: str, data: bytes) -> None:
+        p = Path(path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(data)
+
+    def exists(self, path: str) -> bool:
+        return Path(path).exists()
+
+
+def _write_jsonl_local(path: Path, rows: List[Dict[str, Any]]) -> None:
+    """Write JSONL using stdlib json; compatible with your read_jsonl (orjson loads)."""
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as f:
         for r in rows:
             f.write(json.dumps(r, ensure_ascii=False) + "\n")
 
 
-# -----------------------------
-# Minimal store adapter for read_jsonl(store, path, ...)
-# Assumption: read_jsonl uses store.open(path, "r", encoding="utf-8") (very common in your codebase style)
-# -----------------------------
-class LocalStore:
-    def open(self, path: str, mode: str = "r", encoding: str | None = "utf-8"):
-        return open(path, mode, encoding=encoding)
-
-
 @pytest.mark.smoke
 def test_train_smoke_two_steps_with_eval_transformers5(tmp_path: Path) -> None:
     # -----------------------------
-    # 1) Write synthetic pair file
+    # 1) Write synthetic pair file (YOUR schema)
+    #
     # load_pairs_for_epoch does:
-    #   rel = tpl.format(epoch=...)
+    #   rel = train_pair_path_tpl.format(epoch=epoch)
     #   path = base/rel
-    # so we must match that layout exactly.
+    #
+    # So we must create the file exactly at: tmp_path / rel
     # -----------------------------
     base = tmp_path
     train_pair_path_tpl = "pairs_epoch_{epoch}.jsonl"
@@ -69,7 +80,7 @@ def test_train_smoke_two_steps_with_eval_transformers5(tmp_path: Path) -> None:
             "source": "s",
         }
 
-    _write_jsonl(
+    _write_jsonl_local(
         pairs_path,
         [
             {
@@ -136,8 +147,6 @@ def test_train_smoke_two_steps_with_eval_transformers5(tmp_path: Path) -> None:
 
     # -----------------------------
     # 6) Transformers 5 TrainingArguments
-    #   - eval_strategy (new name)
-    #   - remove_unused_columns=False for custom batch keys in collator
     # -----------------------------
     args = TrainingArguments(
         output_dir=str(tmp_path / "out"),
@@ -157,9 +166,8 @@ def test_train_smoke_two_steps_with_eval_transformers5(tmp_path: Path) -> None:
     )
 
     # -----------------------------
-    # 7) Transformers 5 Trainer API: processing_class (new name)
-    # PairwiseTrainerWithRankingEval signature:
-    #   __init__(..., valid_packs=..., max_length=..., **kwargs)
+    # 7) Trainer (Transformers 5: processing_class)
+    # PairwiseTrainerWithRankingEval takes valid_packs/max_length as explicit kwargs
     # -----------------------------
     trainer = PairwiseTrainerWithRankingEval(
         model=model,
@@ -180,16 +188,12 @@ def test_train_smoke_two_steps_with_eval_transformers5(tmp_path: Path) -> None:
     # 8) Assertions
     # -----------------------------
     assert trainer.state.global_step == 2
+    assert torch.isfinite(torch.tensor(float(out.training_loss)))
 
-    training_loss = getattr(out, "training_loss", None)
-    assert training_loss is not None
-    assert torch.isfinite(torch.tensor(float(training_loss)))
-
-    # checkpoint might be named checkpoint-2 (common), but we keep it robust:
+    # checkpoint existence (robust)
     out_dir = Path(args.output_dir)
     ckpts = sorted([p for p in out_dir.glob("checkpoint-*") if p.is_dir()])
     assert ckpts, f"no checkpoint-* found under {out_dir}"
-    assert any(p.name.endswith("-2") for p in ckpts) or len(ckpts) >= 1
 
     metrics = trainer.evaluate()
     assert isinstance(metrics, dict)
