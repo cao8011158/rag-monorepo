@@ -210,6 +210,9 @@ def main() -> None:
         logging_dir=logging_dir,
         remove_unused_columns=False,          # keep custom keys
         dataloader_num_workers=num_workers,
+        load_best_model_at_end=True,      # ⭐⭐⭐关键
+        metric_for_best_model=f"eval_ndcg@{ndcg_k}",
+        greater_is_better=True,
     )
 
     # -------------------------
