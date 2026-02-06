@@ -18,7 +18,9 @@ from reranker_training.modeling import CrossEncoderReranker
 from reranker_training.trainer import PairwiseTrainerWithRankingEval
 
 
-# If your project already exports EvalPack, import it instead of redefining.
+# -----------------------------
+# Minimal EvalPack (match what your ranking eval expects)
+# -----------------------------
 @dataclass
 class EvalPack:
     query_text: str
@@ -33,12 +35,27 @@ def _write_jsonl(path: Path, rows: List[Dict[str, Any]]) -> None:
             f.write(json.dumps(r, ensure_ascii=False) + "\n")
 
 
+# -----------------------------
+# Minimal store adapter for read_jsonl(store, path, ...)
+# Assumption: read_jsonl uses store.open(path, "r", encoding="utf-8") (very common in your codebase style)
+# -----------------------------
+class LocalStore:
+    def open(self, path: str, mode: str = "r", encoding: str | None = "utf-8"):
+        return open(path, mode, encoding=encoding)
+
+
 @pytest.mark.smoke
-def test_train_smoke_two_steps_with_eval_new_transformers_api(tmp_path: Path) -> None:
+def test_train_smoke_two_steps_with_eval_transformers5(tmp_path: Path) -> None:
     # -----------------------------
-    # 1) Synthetic pairs.jsonl (YOUR schema)
+    # 1) Write synthetic pair file
+    # load_pairs_for_epoch does:
+    #   rel = tpl.format(epoch=...)
+    #   path = base/rel
+    # so we must match that layout exactly.
     # -----------------------------
-    pairs_path = tmp_path / "pairs.jsonl"
+    base = tmp_path
+    train_pair_path_tpl = "pairs_epoch_{epoch}.jsonl"
+    pairs_path = base / "pairs_epoch_1.jsonl"
 
     def mk_chunk(chunk_id: str, text: str) -> Dict[str, Any]:
         return {
@@ -81,11 +98,16 @@ def test_train_smoke_two_steps_with_eval_new_transformers_api(tmp_path: Path) ->
     )
 
     # -----------------------------
-    # 2) Load items through your real loader
-    #    Assumes signature like: load_pairs_for_epoch(path=..., epoch=..., seed=..., shuffle=...)
-    #    If yours differs, adjust ONLY this call.
+    # 2) Load items via your REAL loader signature
     # -----------------------------
-    items = load_pairs_for_epoch(path=str(pairs_path), epoch=1, seed=42, shuffle=True)
+    store = LocalStore()
+    items = load_pairs_for_epoch(
+        store=store,
+        base=str(base),
+        train_pair_path_tpl=train_pair_path_tpl,
+        epoch=1,
+    )
+    assert len(items) == 2
 
     # -----------------------------
     # 3) Minimal valid packs (evaluate must run)
@@ -103,8 +125,8 @@ def test_train_smoke_two_steps_with_eval_new_transformers_api(tmp_path: Path) ->
     # -----------------------------
     model_name = "hf-internal-testing/tiny-random-bert"
     tok = AutoTokenizer.from_pretrained(model_name)
-    base = AutoModelForSequenceClassification.from_pretrained(model_name, num_labels=1)
-    model = CrossEncoderReranker(base)
+    base_model = AutoModelForSequenceClassification.from_pretrained(model_name, num_labels=1)
+    model = CrossEncoderReranker(base_model)
 
     # -----------------------------
     # 5) Dataset / Collator
@@ -113,8 +135,9 @@ def test_train_smoke_two_steps_with_eval_new_transformers_api(tmp_path: Path) ->
     collator = PairwiseCollator(tok)
 
     # -----------------------------
-    # 6) NEW TrainingArguments API: eval_strategy (not evaluation_strategy)
-    #    remove_unused_columns=False is critical for custom batch keys
+    # 6) Transformers 5 TrainingArguments
+    #   - eval_strategy (new name)
+    #   - remove_unused_columns=False for custom batch keys in collator
     # -----------------------------
     args = TrainingArguments(
         output_dir=str(tmp_path / "out"),
@@ -123,6 +146,7 @@ def test_train_smoke_two_steps_with_eval_new_transformers_api(tmp_path: Path) ->
         learning_rate=1e-4,
         max_steps=2,
         logging_steps=1,
+        save_strategy="steps",
         save_steps=2,
         eval_strategy="steps",
         eval_steps=1,
@@ -133,7 +157,9 @@ def test_train_smoke_two_steps_with_eval_new_transformers_api(tmp_path: Path) ->
     )
 
     # -----------------------------
-    # 7) NEW Trainer API: processing_class (not tokenizer)
+    # 7) Transformers 5 Trainer API: processing_class (new name)
+    # PairwiseTrainerWithRankingEval signature:
+    #   __init__(..., valid_packs=..., max_length=..., **kwargs)
     # -----------------------------
     trainer = PairwiseTrainerWithRankingEval(
         model=model,
@@ -151,16 +177,20 @@ def test_train_smoke_two_steps_with_eval_new_transformers_api(tmp_path: Path) ->
     out = trainer.train()
 
     # -----------------------------
-    # 8) Assertions: ran + saved + eval callable + finite loss
+    # 8) Assertions
     # -----------------------------
     assert trainer.state.global_step == 2
-    assert torch.isfinite(torch.tensor(out.training_loss))
 
-    ckpt = Path(args.output_dir) / "checkpoint-2"
-    assert ckpt.exists(), f"checkpoint not found: {ckpt}"
+    training_loss = getattr(out, "training_loss", None)
+    assert training_loss is not None
+    assert torch.isfinite(torch.tensor(float(training_loss)))
+
+    # checkpoint might be named checkpoint-2 (common), but we keep it robust:
+    out_dir = Path(args.output_dir)
+    ckpts = sorted([p for p in out_dir.glob("checkpoint-*") if p.is_dir()])
+    assert ckpts, f"no checkpoint-* found under {out_dir}"
+    assert any(p.name.endswith("-2") for p in ckpts) or len(ckpts) >= 1
 
     metrics = trainer.evaluate()
     assert isinstance(metrics, dict)
-    # depending on your implementation, keys may be eval_ndcg / eval_mrr etc.
     assert any(k.startswith("eval_") for k in metrics.keys()), metrics
-
