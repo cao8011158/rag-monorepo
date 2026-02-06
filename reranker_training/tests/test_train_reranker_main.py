@@ -2,6 +2,7 @@ import types
 import pytest
 
 import reranker_training.train_reranker as tr
+from transformers.trainer_utils import IntervalStrategy
 
 
 # -------------------------
@@ -95,9 +96,21 @@ def make_settings_dict():
             "dropout": 0.05,
             "target_modules": ["query", "key", "value", "dense"],
         },
+        # 顶层开关（你的 main 里看起来就是读这俩）
         "bf16": True,
         "fp16": False,
     }
+
+
+def _force_cpu_safe_mixed_precision(s: dict) -> dict:
+    """
+    Unit tests should be hardware-agnostic.
+    Disable bf16/fp16 so HF TrainingArguments won't crash on CPU env.
+    """
+    s = dict(s)  # shallow copy
+    s["bf16"] = False
+    s["fp16"] = False
+    return s
 
 
 def test_posix_join():
@@ -115,16 +128,14 @@ def test_main_happy_path(monkeypatch, capsys):
     )
 
     # ---- settings + stores ----
-    s = make_settings_dict()
+    s = _force_cpu_safe_mixed_precision(make_settings_dict())
     monkeypatch.setattr(tr, "load_settings", lambda p: s)
     monkeypatch.setattr(tr, "build_store_registry", lambda cfg: {"fs_local": object()})
 
     # ---- data loaders ----
-    # epoch0 pairs
     ep0 = [{"dummy": "pair0"}]
     monkeypatch.setattr(tr, "load_pairs_for_epoch", lambda **kwargs: list(ep0))
 
-    # valid packs (dict 也行，只要你的 load_valid_query_packs 返回的类型能被 trainer 使用)
     valid_packs = [{"query_text": "q", "doc_texts": ["d1", "d2"], "labels": [1, 0]}]
     monkeypatch.setattr(tr, "load_valid_query_packs", lambda **kwargs: list(valid_packs))
 
@@ -133,7 +144,6 @@ def test_main_happy_path(monkeypatch, capsys):
     monkeypatch.setattr(tr.AutoModelForSequenceClassification, "from_pretrained", lambda *a, **k: DummyBaseModel())
 
     # ---- LoRA / wrapper ----
-    # 不测 peft 真注入：直接返回 base_model（但要确保有 requires_grad 参数，否则你的 trainable 断言会炸）
     monkeypatch.setattr(tr, "_apply_lora_once", lambda base_model, **k: base_model)
     monkeypatch.setattr(tr, "CrossEncoderReranker", lambda m: m)
 
@@ -142,6 +152,7 @@ def test_main_happy_path(monkeypatch, capsys):
     monkeypatch.setattr(tr, "PairwiseCollator", lambda tok: object())
 
     created = {}
+
     def _mk_trainer(**kwargs):
         t = DummyTrainer(**kwargs)
         created["trainer"] = t
@@ -163,7 +174,7 @@ def test_main_happy_path(monkeypatch, capsys):
     assert created["trainer"].saved_dir == s["training"]["output_dir"]
 
     # tokenizer pad_token filled
-    tok = created["trainer"].kwargs["tokenizer"]
+    tok = created["trainer"].kwargs["processing_class"]
     assert tok.pad_token == "<eos>"
 
 
@@ -174,7 +185,7 @@ def test_lora_target_modules_validation(monkeypatch):
         lambda self: types.SimpleNamespace(config="configs/train.yaml"),
     )
 
-    s = make_settings_dict()
+    s = _force_cpu_safe_mixed_precision(make_settings_dict())
     s["lora"]["target_modules"] = "not-a-list"  # invalid
 
     monkeypatch.setattr(tr, "load_settings", lambda p: s)
@@ -197,7 +208,7 @@ def test_training_arguments_mapping(monkeypatch):
         lambda self: types.SimpleNamespace(config="configs/train.yaml"),
     )
 
-    s = make_settings_dict()
+    s = _force_cpu_safe_mixed_precision(make_settings_dict())
     monkeypatch.setattr(tr, "load_settings", lambda p: s)
     monkeypatch.setattr(tr, "build_store_registry", lambda cfg: {"fs_local": object()})
 
@@ -212,7 +223,11 @@ def test_training_arguments_mapping(monkeypatch):
     monkeypatch.setattr(tr, "PairwiseCollator", lambda tok: object())
 
     created = {}
-    monkeypatch.setattr(tr, "PairwiseTrainerWithRankingEval", lambda **kwargs: created.setdefault("trainer", DummyTrainer(**kwargs)))
+    monkeypatch.setattr(
+        tr,
+        "PairwiseTrainerWithRankingEval",
+        lambda **kwargs: created.setdefault("trainer", DummyTrainer(**kwargs)),
+    )
 
     tr.main()
 
@@ -227,8 +242,9 @@ def test_training_arguments_mapping(monkeypatch):
     assert args_tr.save_steps == tr_cfg["save_every_steps"]
     assert args_tr.dataloader_num_workers == tr_cfg["num_workers"]
 
-    assert args_tr.bf16 is True
+    # Unit test env: disable mixed precision
+    assert args_tr.bf16 is False
     assert args_tr.fp16 is False
 
-    assert args_tr.evaluation_strategy == "steps"
-    assert args_tr.save_strategy == "steps"
+    assert args_tr.eval_strategy == IntervalStrategy.STEPS
+    assert args_tr.save_strategy == IntervalStrategy.STEPS

@@ -64,7 +64,9 @@ score(query, positive) > score(query, negative)
 }
 ```
 
----
+##运行测试
+pytest -m smoke -q
+pytest -m slow -q
 
 ## 🚀 运行训练
 
