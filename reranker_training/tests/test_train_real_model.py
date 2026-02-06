@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, List, Optional
 
 import pytest
 import torch
@@ -38,27 +38,12 @@ def _write_jsonl(path: Path, rows: List[Dict[str, Any]]) -> None:
 
 # -------------------------------------------------
 # Minimal Local Store for tests
-# (adapts to common store interfaces)
 # -------------------------------------------------
 class MinimalLocalStore:
-    """
-    A tiny filesystem-backed store for tests.
-
-    Your load_pairs_for_epoch(store=..., base=..., ...) likely does one of:
-      - store.open(rel_path, "r")
-      - store.read_text(rel_path)
-      - store.read_jsonl(rel_path)
-      - store.get_bytes(rel_path) / store.read_bytes(rel_path)
-
-    This class provides several common methods so your loader can use it
-    without importing your project's real store class.
-    """
-
     def __init__(self, root: Optional[Path] = None) -> None:
         self.root = Path(root) if root is not None else Path(".")
 
     def _to_path(self, p: str) -> Path:
-        # loader is passing absolute joined path (base/rel) OR rel path; handle both
         pp = Path(p)
         return pp if pp.is_absolute() else (self.root / pp)
 
@@ -86,19 +71,9 @@ class MinimalLocalStore:
 
 
 @pytest.mark.slow
-def test_train_two_steps_real_model_transformers5(tmp_path: Path) -> None:
+def test_train_two_steps_real_model_transformers5_bf16(tmp_path: Path) -> None:
     # -------------------------
-    # 0) IMPORTANT PRECONDITION (in your library code):
-    #    PairwiseTrainer.compute_loss must accept TF5 extra kwargs, e.g.:
-    #      def compute_loss(..., **kwargs):
-    #    otherwise Trainer will throw:
-    #      unexpected keyword argument 'num_items_in_batch'
-    # -------------------------
-
-    # -------------------------
-    # 1) Write synthetic pairs file at EXACT location your loader expects
-    #    rel = train_pair_path_tpl.format(epoch=epoch)
-    #    path = base/rel
+    # 1) Write synthetic pairs file
     # -------------------------
     base = tmp_path
     train_pair_path_tpl = "pairs_epoch_{epoch}.jsonl"
@@ -111,7 +86,6 @@ def test_train_two_steps_real_model_transformers5(tmp_path: Path) -> None:
             "chunk_index": 0,
             "chunk_text": text,
             "chunk_text_hash": f"hash-{chunk_id}",
-            # optional metadata fields
             "url": "https://example.com",
             "title": "t",
             "source": "s",
@@ -148,7 +122,7 @@ def test_train_two_steps_real_model_transformers5(tmp_path: Path) -> None:
     assert len(items) == 2
 
     # -------------------------
-    # 3) Eval packs (your overridden evaluate() uses these)
+    # 3) Eval packs
     # -------------------------
     valid_packs = [
         EvalPack(
@@ -160,14 +134,18 @@ def test_train_two_steps_real_model_transformers5(tmp_path: Path) -> None:
 
     # -------------------------
     # 4) Real model + LoRA
+    #    IMPORTANT: keep base weights in fp32
     # -------------------------
+    if not torch.cuda.is_available():
+        pytest.skip("bf16 training requires CUDA for this slow integration test")
+
     model_name = "BAAI/bge-reranker-v2-m3"
     tok = AutoTokenizer.from_pretrained(model_name)
 
     base_model = AutoModelForSequenceClassification.from_pretrained(
         model_name,
         num_labels=1,
-        torch_dtype=torch.float16 if torch.cuda.is_available() else None,
+        # ✅ keep fp32 weights (do NOT pass torch_dtype)
         ignore_mismatched_sizes=True,
     )
 
@@ -176,7 +154,7 @@ def test_train_two_steps_real_model_transformers5(tmp_path: Path) -> None:
         r=4,
         lora_alpha=8,
         lora_dropout=0.0,
-        target_modules=["query", "key", "value", "dense"],  # you confirmed it matches
+        target_modules=["query", "key", "value", "dense"],
         bias="none",
     )
     base_model = get_peft_model(base_model, lora_cfg)
@@ -189,8 +167,7 @@ def test_train_two_steps_real_model_transformers5(tmp_path: Path) -> None:
     collator = PairwiseCollator(tok)
 
     # -------------------------
-    # 6) Transformers 5 TrainingArguments
-    #    IMPORTANT: eval_strategy != "no" => Trainer requires eval_dataset != None
+    # 6) TrainingArguments: bf16 AMP, fp32 weights
     # -------------------------
     args = TrainingArguments(
         output_dir=str(tmp_path / "out"),
@@ -205,8 +182,8 @@ def test_train_two_steps_real_model_transformers5(tmp_path: Path) -> None:
         eval_steps=1,
         remove_unused_columns=False,
         report_to=[],
-        fp16=torch.cuda.is_available(),
-        bf16=False,
+        fp16=False,
+        bf16=True,
     )
 
     # -------------------------
@@ -216,9 +193,9 @@ def test_train_two_steps_real_model_transformers5(tmp_path: Path) -> None:
         model=model,
         args=args,
         train_dataset=ds,
-        eval_dataset=ds,          # ✅ required by TF5 init check
+        eval_dataset=ds,          # required when eval_strategy != "no"
         data_collator=collator,
-        processing_class=tok,     # ✅ TF5 new arg name
+        processing_class=tok,     # TF5 new arg name
         valid_packs=valid_packs,
         max_length=128,
         ndcg_k=10,
@@ -234,7 +211,7 @@ def test_train_two_steps_real_model_transformers5(tmp_path: Path) -> None:
     assert (Path(args.output_dir) / "checkpoint-2").exists()
 
     # -------------------------
-    # 9) Evaluate (your overridden evaluate() prefixes eval_)
+    # 9) Evaluate
     # -------------------------
     metrics = trainer.evaluate()
     assert any(k.startswith("eval_") for k in metrics.keys())
