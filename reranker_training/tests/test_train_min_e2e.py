@@ -205,7 +205,12 @@ def test_min_real_train_numeric_health_and_eval(tmp_path):
     base = TinySeqClsModel(vocab_size=2000, hidden_size=32)
     model = CrossEncoderReranker(base)
 
-    before = {n: p.detach().clone() for n, p in model.named_parameters() if p.requires_grad}
+    # snapshot to CPU to avoid cuda/cpu comparison crash
+    before = {
+        n: p.detach().float().cpu().clone()
+        for n, p in model.named_parameters()
+        if p.requires_grad
+    }
 
     out_dir = tmp_path / "out"
     args = TrainingArguments(
@@ -248,7 +253,11 @@ def test_min_real_train_numeric_health_and_eval(tmp_path):
     assert all(isinstance(x, (int, float)) and math.isfinite(float(x)) for x in losses)
 
     # parameters updated
-    after = {n: p.detach().clone() for n, p in model.named_parameters() if p.requires_grad}
+    after = {
+    n: p.detach().float().cpu().clone()
+    for n, p in model.named_parameters()
+    if p.requires_grad
+    }
     assert set(before.keys()) == set(after.keys())
     changed = any(not torch.allclose(before[n], after[n]) for n in before.keys())
     assert changed, "Expected at least one trainable parameter to change after training."
