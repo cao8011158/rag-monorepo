@@ -58,7 +58,7 @@ training:
   eval_every_steps: 200
   save_every_steps: 200
 
-  max_steps: null # set integer to cap training
+  max_steps: -1 # set integer to cap training
 
 # Evaluation
 
