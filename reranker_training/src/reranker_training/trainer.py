@@ -36,7 +36,7 @@ class PairwiseTrainer(Trainer):
       loss = softplus(-(s_pos - s_neg))
     """
 
-    def compute_loss(self, model: nn.Module, inputs: Dict[str, Any], return_outputs: bool = False):
+    def compute_loss(self, model: nn.Module, inputs: Dict[str, Any], return_outputs: bool = False,  **kwargs):
         pos_ids = inputs["pos_input_ids"]
         pos_mask = inputs["pos_attention_mask"]
         neg_ids = inputs["neg_input_ids"]
