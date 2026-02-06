@@ -96,8 +96,8 @@ def main() -> None:
     log_steps = int(tr.get("log_every_steps", 50))
     eval_steps = int(tr.get("eval_every_steps", 200))
     save_steps = int(tr.get("save_every_steps", 200))
-    max_steps = tr.get("max_steps", None)
-    max_steps = int(max_steps) if isinstance(max_steps, int) else None
+    max_steps = tr.get("max_steps", -1)
+    max_steps = int(max_steps) if isinstance(max_steps, int) else -1
     num_workers = int(tr.get("num_workers", 0))
 
     bf16 = bool(s.get("bf16", False))
@@ -205,7 +205,7 @@ def main() -> None:
         save_total_limit=2,
         bf16=bf16,
         fp16=fp16,
-        max_steps=max_steps,  # None or int
+        max_steps=-1,  
         report_to=["tensorboard"],
         logging_dir=logging_dir,
         remove_unused_columns=False,          # keep custom keys
