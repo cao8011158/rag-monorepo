@@ -35,7 +35,7 @@ models:
 
   reranker:
     provider: hf_transformers
-    model_name: "BAAI/bge-reranker-v2-m3"
+    model_name: /content/drive/MyDrive/rag-kb-data/run1/checkpoint-1257
     device: cuda # cpu / cuda
     cache_dir: /content/drive/MyDrive/rag-kb-data/data/.hf_cache
     batch_size: 32 # rerank 批量；显存紧就 16
