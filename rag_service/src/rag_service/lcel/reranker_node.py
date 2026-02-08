@@ -8,7 +8,7 @@ from langchain_core.documents import Document
 from langchain_core.runnables import RunnableLambda
 
 def create_reranker_runnable(settings) -> RunnableLambda:
-    cfg = settings["reranker"]  # 你的 config 段
+    cfg = settings["models"]["reranker"]  # 你的 config 段
 
     model_name = cfg["model_name"]
     device = cfg.get("device", "cpu")
