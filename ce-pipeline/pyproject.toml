@@ -28,6 +28,7 @@ dependencies = [
   "langchain-community>=0.2.0",
   "langchain-text-splitters>=0.2.0",
   "langchain-huggingface>=0.2.0",
+  "Whoosh>=2.7.4",
 ]
 
 [project.optional-dependencies]

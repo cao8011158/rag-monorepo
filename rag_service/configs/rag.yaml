@@ -1,0 +1,73 @@
+# configs/rag.yaml
+
+service:
+  host: "0.0.0.0"
+  port: 8000
+
+stores:
+  fs_local:
+    kind: filesystem
+    root: /content/drive/MyDrive/rag-kb-data
+
+# ---------- Inputs: ce-pipeline artifacts ----------
+inputs:
+  ce_artifacts:
+    chunks:
+      store: fs_local
+      base: ce_out/chunks
+      chunks_file: chunks.jsonl
+
+    vector_index:
+      store: fs_local
+      base: ce_out/indexes/vector
+      faiss_index: faiss.index
+      id_map: id_map.jsonl
+
+    bm25_index:
+      store: fs_local
+      base: ce_out/indexes/bm25
+      bm25_pkl: bm25.pkl
+
+# ---------- Models ----------
+models:
+  gemini_api:
+    model_name: gemini-3-flash-preview
+
+  reranker:
+    provider: hf_transformers
+    model_name: "BAAI/bge-reranker-v2-m3"
+    device: cuda # cpu / cuda
+    cache_dir: /content/drive/MyDrive/rag-kb-data/data/.hf_cache
+    batch_size: 32 # rerank 批量；显存紧就 16
+    max_length: 512 # query+doc 的最大 token 长度（常用 512）
+
+  #embedder for dense retrieval queries (only if rq-pipeline needs to embed queries)
+  embedding:
+    model_name: "intfloat/e5-base-v2"
+    device: cpu # "cpu" / "cuda" / None(auto)
+    batch_size: 64
+    cache_dir: /content/drive/MyDrive/rag-kb-data/data/.hf_cache
+    normalize_embeddings: true
+    instructions:
+      passage: "passage: "
+      query: "query: "
+
+# ---------- Retrieval ----------
+retrieval:
+  mode: hybrid # dense | bm25 | hybrid
+  top_k: 30 # candidates pool per query
+
+  dense:
+    top_k: 30
+
+  bm25:
+    top_k: 60
+
+  hybrid_fusion:
+    method: rrf # rrf | linear
+    rrf_k: 60
+
+# ---------- Generation----------
+generation:
+  max_context_token: 20000
+  max_docs: 2

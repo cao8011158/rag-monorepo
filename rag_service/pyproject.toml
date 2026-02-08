@@ -1,0 +1,50 @@
+[build-system]
+requires = ["setuptools>=69.0.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rag_service"
+version = "0.1.0"
+description = "Final RAG service scaffold (FastAPI + retrieval + shared artifacts)."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+
+dependencies = [
+  "pyyaml>=6.0.1",
+  "orjson>=3.10.0",
+  "tqdm>=4.66.0",
+  "numpy>=1.26.0",
+  "rank-bm25>=0.2.2",
+  "whoosh>=2.7.4",
+  "fastapi>=0.110.0",
+  "torch>=2.1", 
+  "sentence-transformers>=3.0",
+  "uvicorn[standard]>=0.27.0",
+
+  "faiss-cpu>=1.8.0",
+  "httpx>=0.27.0",
+  "google-genai>=1.0",
+  "pydantic>=2.6.0",
+
+  "langchain>=0.2.0",
+  "langchain-core>=0.2.0",
+  "langchain-google-genai>=1.0.0",
+  
+  "fastapi>=0.110",
+  "uvicorn[standard]>=0.29",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0.0",
+  "ruff>=0.4.0",
+  "mypy>=1.8.0",
+  "types-PyYAML>=6.0.12.20241230",
+]
+
+[project.scripts]
+rag = "rag_service.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
