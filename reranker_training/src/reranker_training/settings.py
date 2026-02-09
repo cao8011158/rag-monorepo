@@ -148,7 +148,7 @@ def apply_defaults(raw: SettingsDict) -> SettingsDict:
     tr.setdefault("log_every_steps", 50)
     tr.setdefault("eval_every_steps", 200)
     tr.setdefault("save_every_steps", 200)
-    tr.setdefault("max_steps", None)
+    tr.setdefault("max_steps", None)  # None => no explicit step limit
 
     # ---- eval ----
     s.setdefault("eval", {})
@@ -267,8 +267,14 @@ def validate_settings(s: SettingsDict) -> None:
     _as_int(tr.get("eval_every_steps"), "training.eval_every_steps", min_value=1)
     _as_int(tr.get("save_every_steps"), "training.save_every_steps", min_value=1)
 
+    # ✅ UPDATED: allow -1 (meaning "no step limit") OR >= 1
+    # - None => not set / no explicit step limit
+    # - -1   => explicitly "no step limit" (HF-style)
+    # - >=1  => hard cap by steps
     if tr.get("max_steps") is not None:
-        _as_int(tr.get("max_steps"), "training.max_steps", min_value=1)
+        ms = _as_int(tr.get("max_steps"), "training.max_steps")  # parse int-like
+        if ms != -1 and ms < 1:
+            raise ValueError(f"training.max_steps must be -1 or >= 1, got {ms}")
 
     # ---- eval ----
     ev = s.get("eval")
