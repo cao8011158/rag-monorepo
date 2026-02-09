@@ -36,11 +36,11 @@ models:
   reranker:
     provider: hf_peft
     base_model: "BAAI/bge-reranker-v2-m3"
-    adapter_path: "/content/drive/MyDrive/rag-kb-data/run1257_adapter"
+    adapter_path: "/content/drive/MyDrive/rag-kb-data/run1"
     cache_dir: /content/drive/MyDrive/rag-kb-data/data/.hf_cache
     device: cuda
     max_length: 512
-    batch_size: 32
+    batch_size: 16
 
   #embedder for dense retrieval queries (only if rq-pipeline needs to embed queries)
   embedding:
