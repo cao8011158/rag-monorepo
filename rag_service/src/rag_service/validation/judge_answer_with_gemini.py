@@ -16,6 +16,18 @@ class JudgeResult(TypedDict, total=False):
     extra_claims: List[str]      # claims not supported by gold (or by chunk if provided)
     is_grounded: Optional[bool]  # only if check_grounding=True and chunk_text provided
 
+# =========================
+# Utils
+# =========================
+
+def _get_required(cfg: Dict[str, Any], path: str) -> Any:
+    cur: Any = cfg
+    for part in path.split("."):
+        if not isinstance(cur, dict) or part not in cur:
+            raise KeyError(f"Missing required config key: {path}")
+        cur = cur[part]
+    return cur
+
 
 # =========================
 # Structured output schema
