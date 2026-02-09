@@ -78,7 +78,7 @@ def generate_grounded_qa_with_gemini(
     query_text: str,
     chunk_text: str,
     model_name: str,
-    max_retries: int = 3,
+    max_retries: int = 6,
     backoff_sec: float = 1.5,
 ) -> Dict[str, str]:
     """
