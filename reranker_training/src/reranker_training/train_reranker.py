@@ -24,7 +24,7 @@ from reranker_training.data.data_preprocessing import (
     load_pairs_for_epoch,
     load_valid_query_packs,
 )
-from reranker_training.src.reranker_training.trainer import PairwiseTrainerWithRankingEval
+from reranker_training.trainer import PairwiseTrainerWithRankingEval
 
 
 # ============================================================
