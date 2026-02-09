@@ -30,23 +30,80 @@ from reranker_training.data.data_preprocessing import (
 # ▶ USE     : Pairwise ranking loss
 # ============================================================
 
+# ============================================================
+#  Helpers
+# ============================================================
+
+def _to_scores(logits: torch.Tensor) -> torch.Tensor:
+    """
+    Normalize HF sequence-classification logits to a single score per example.
+    Expected output shape: [B]
+    """
+    if logits.dim() == 2 and logits.size(-1) == 1:
+        return logits.squeeze(-1)
+    if logits.dim() == 2 and logits.size(-1) > 1:
+        # fallback: take last logit as relevance
+        return logits[:, -1]
+    return logits
+
+
+def _safe_forward(model: nn.Module, batch: Dict[str, torch.Tensor]) -> Any:
+    """
+    Call HF/PEFT model with keyword args.
+    If token_type_ids is rejected (some non-BERT models), retry without it.
+    """
+    try:
+        return model(**batch)
+    except TypeError:
+        # Some models may still reject token_type_ids even if tokenizer returns it.
+        if "token_type_ids" in batch:
+            batch2 = dict(batch)
+            batch2.pop("token_type_ids", None)
+            return model(**batch2)
+        raise
+
+
+# ============================================================
+#  PairwiseTrainer (TRAINING)
+#
+# ▶ OVERRIDE: Trainer.compute_loss()
+# ▶ USE     : Pairwise ranking loss
+# ============================================================
+
 class PairwiseTrainer(Trainer):
     """
     Pairwise logistic loss using s_pos - s_neg:
       loss = softplus(-(s_pos - s_neg))
     """
 
-    def compute_loss(self, model: nn.Module, inputs: Dict[str, Any], return_outputs: bool = False,  **kwargs):
-        pos_ids = inputs["pos_input_ids"]
-        pos_mask = inputs["pos_attention_mask"]
-        neg_ids = inputs["neg_input_ids"]
-        neg_mask = inputs["neg_attention_mask"]
+    def compute_loss(
+        self,
+        model: nn.Module,
+        inputs: Dict[str, Any],
+        return_outputs: bool = False,
+        **kwargs,
+    ):
+        pos: Dict[str, torch.Tensor] = {
+            "input_ids": inputs["pos_input_ids"],
+            "attention_mask": inputs["pos_attention_mask"],
+        }
+        neg: Dict[str, torch.Tensor] = {
+            "input_ids": inputs["neg_input_ids"],
+            "attention_mask": inputs["neg_attention_mask"],
+        }
 
         pos_tt = inputs.get("pos_token_type_ids", None)
         neg_tt = inputs.get("neg_token_type_ids", None)
+        if pos_tt is not None:
+            pos["token_type_ids"] = pos_tt
+        if neg_tt is not None:
+            neg["token_type_ids"] = neg_tt
 
-        s_pos = model(pos_ids, pos_mask, pos_tt) if pos_tt is not None else model(pos_ids, pos_mask)
-        s_neg = model(neg_ids, neg_mask, neg_tt) if neg_tt is not None else model(neg_ids, neg_mask)
+        out_pos = _safe_forward(model, pos)
+        out_neg = _safe_forward(model, neg)
+
+        s_pos = _to_scores(out_pos.logits)
+        s_neg = _to_scores(out_neg.logits)
 
         diff = s_pos - s_neg
         loss = torch.nn.functional.softplus(-diff).mean()
@@ -87,36 +144,8 @@ def mrr_at_k(rels_sorted: List[int], k: int) -> float:
 
 
 # ============================================================
-# Evaluation Flow (Bottom → Top)
-# ------------------------------------------------------------
-# 1️⃣ score_query_docs()
-#     - 最底层：模型推理打分
-#     - 对单个 query + 多个 docs：
-#        tokenize → batch forward → 得到 relevance scores
-#
-# 2️⃣ evaluate_ranking()
-#     - 中层：排序评估逻辑
-#     - 对每个 query pack：
-#           调用 score_query_docs()
-#           根据 scores 排序 docs
-#           计算 NDCG@k / MRR@k
-#
-# 3️⃣ PairwiseTrainerWithRankingEval.evaluate()
-#     - 最外层：Trainer 生命周期入口
-#     - 在 validation 时触发：
-#           调用 evaluate_ranking()
-#           将指标写入 HF logging / dashboard
-#
-# Overall Call Stack:
-#
-#   Trainer.evaluate()
-#        ↓
-#   evaluate_ranking()
-#        ↓
-#   score_query_docs()
-#
+# Evaluation scoring
 # ============================================================
-
 
 @torch.no_grad()
 def score_query_docs(
@@ -132,8 +161,9 @@ def score_query_docs(
     model.eval()
     scores: List[float] = []
 
-    for i in range(0, len(doc_texts), int(batch_size)):
-        batch_docs = doc_texts[i : i + int(batch_size)]
+    bs = int(batch_size)
+    for i in range(0, len(doc_texts), bs):
+        batch_docs = doc_texts[i : i + bs]
         enc = tokenizer(
             [query_text] * len(batch_docs),
             batch_docs,
@@ -144,8 +174,8 @@ def score_query_docs(
         )
         enc = {k: v.to(device) for k, v in enc.items()}
 
-        tt = enc.get("token_type_ids", None)
-        s = model(enc["input_ids"], enc["attention_mask"], tt) if tt is not None else model(enc["input_ids"], enc["attention_mask"])
+        out = _safe_forward(model, enc)
+        s = _to_scores(out.logits)
         scores.extend(s.detach().float().cpu().tolist())
 
     return scores
@@ -176,7 +206,6 @@ def evaluate_ranking(
             batch_size=infer_batch_size,
         )
 
-        # sort by score desc
         idx = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)
         rels_sorted = [p.labels[i] for i in idx]
 
@@ -191,9 +220,13 @@ def evaluate_ranking(
     }
 
 
+# ============================================================
+# Trainer with ranking eval
+# ============================================================
+
 class PairwiseTrainerWithRankingEval(PairwiseTrainer):
     """
-    Overrides evaluate() to compute ranking metrics on QueryPacks:
+    Overrides evaluate() to compute ranking metrics on EvalPacks:
       - NDCG@k (main)
       - MRR@k (aux)
     """
@@ -216,7 +249,7 @@ class PairwiseTrainerWithRankingEval(PairwiseTrainer):
         self.infer_batch_size = int(infer_batch_size)
 
     def evaluate(self, *args, **kwargs):
-        # ✅ Trainer 决定的真实 device（支持单卡/多卡/accelerate）
+        # Trainer-decided device (supports accelerate / DDP)
         device = self.args.device
         if hasattr(self, "accelerator") and getattr(self.accelerator, "device", None) is not None:
             device = self.accelerator.device

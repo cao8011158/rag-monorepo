@@ -18,14 +18,13 @@ from peft import LoraConfig, TaskType, get_peft_model
 
 from reranker_training.settings import load_settings
 from reranker_training.stores.registry import build_store_registry
-from reranker_training.modeling import CrossEncoderReranker
 from reranker_training.data.data_preprocessing import (
     CrossEncoderPairwiseDataset,
     PairwiseCollator,
     load_pairs_for_epoch,
     load_valid_query_packs,
 )
-from reranker_training.trainer import PairwiseTrainerWithRankingEval
+from reranker_training.src.reranker_training.trainer import PairwiseTrainerWithRankingEval
 
 
 # ============================================================
@@ -183,7 +182,7 @@ def main() -> None:
         raise RuntimeError(f"LoRA injected 0 trainable params. target_modules={targets}")
     print(f"[LoRA] target_modules={targets}. trainable_params={trainable}")
 
-    model = CrossEncoderReranker(base_model)
+    model = base_model
 
     # tensorboard logging dir
     logging_dir = os.path.join(output_dir, "runs")
@@ -270,7 +269,12 @@ def main() -> None:
     )
 
     trainer.train()
+
+    # 保存最终（best）模型（LoRA adapter）
     trainer.save_model(output_dir)
+
+    # 保存 tokenizer（推理必需）
+    tokenizer.save_pretrained(output_dir)
 
     print(f"[OK] Training done. Output: {output_dir}")
     print(f"TensorBoard logs: {logging_dir}")

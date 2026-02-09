@@ -34,12 +34,13 @@ models:
     model_name: gemini-3-flash-preview
 
   reranker:
-    provider: hf_transformers
-    model_name: /content/drive/MyDrive/rag-kb-data/run1/checkpoint-1257
-    device: cuda # cpu / cuda
+    provider: hf_peft
+    base_model: "BAAI/bge-reranker-v2-m3"
+    adapter_path: "/content/drive/MyDrive/rag-kb-data/run1257_adapter"
     cache_dir: /content/drive/MyDrive/rag-kb-data/data/.hf_cache
-    batch_size: 32 # rerank 批量；显存紧就 16
-    max_length: 512 # query+doc 的最大 token 长度（常用 512）
+    device: cuda
+    max_length: 512
+    batch_size: 32
 
   #embedder for dense retrieval queries (only if rq-pipeline needs to embed queries)
   embedding:
