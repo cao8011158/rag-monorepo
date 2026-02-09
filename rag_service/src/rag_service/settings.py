@@ -49,7 +49,7 @@ def apply_defaults(raw: SettingsDict) -> SettingsDict:
       - stores.*
       - inputs.ce_artifacts.{chunks, vector_index, bm25_index}
       - models.gemini_api.model_name
-      - models.reranker.*
+      - models.reranker.*   (supports hf_transformers & hf_peft)
       - models.embedding.*
       - retrieval.*
       - generation.*
@@ -109,12 +109,21 @@ def apply_defaults(raw: SettingsDict) -> SettingsDict:
     ga = m["gemini_api"]
     ga.setdefault("model_name", "")
 
-    # reranker
+    # reranker (supports hf_transformers OR hf_peft)
     m.setdefault("reranker", {})
     _must_be_mapping(m["reranker"], "models.reranker")
     rr = m["reranker"]
-    rr.setdefault("provider", "hf_transformers")
-    rr.setdefault("model_name", "")
+
+    rr.setdefault("provider", "hf_transformers")  # hf_transformers | hf_peft
+
+    # hf_transformers route
+    rr.setdefault("model_name", "")  # used when provider == hf_transformers
+
+    # hf_peft route (your current config)
+    rr.setdefault("base_model", "")      # used when provider == hf_peft
+    rr.setdefault("adapter_path", "")    # used when provider == hf_peft
+
+    # shared
     rr.setdefault("device", "cpu")  # cpu/cuda
     rr.setdefault("cache_dir", None)
     rr.setdefault("batch_size", 16)
@@ -265,11 +274,26 @@ def validate_settings(s: SettingsDict) -> None:
     rr = m.get("reranker")
     if not isinstance(rr, dict):
         raise ValueError("models.reranker must be a mapping (YAML dict)")
-    _require_nonempty_str(rr.get("provider"), "models.reranker.provider")
-    _require_nonempty_str(rr.get("model_name"), "models.reranker.model_name")
+
+    provider = _require_nonempty_str(rr.get("provider"), "models.reranker.provider")
+    _validate_enum(provider, {"hf_transformers", "hf_peft"}, "models.reranker.provider")
+
+    if provider == "hf_transformers":
+        _require_nonempty_str(rr.get("model_name"), "models.reranker.model_name")
+    else:
+        _require_nonempty_str(rr.get("base_model"), "models.reranker.base_model")
+        _require_nonempty_str(rr.get("adapter_path"), "models.reranker.adapter_path")
+
+        ap = Path(str(rr.get("adapter_path")))
+        if not ap.exists():
+            raise ValueError(f"models.reranker.adapter_path not found: {ap}")
+
     _validate_enum(str(rr.get("device")), {"cpu", "cuda"}, "models.reranker.device")
     _as_int(rr.get("batch_size"), "models.reranker.batch_size", min_value=1)
     _as_int(rr.get("max_length"), "models.reranker.max_length", min_value=1)
+
+    if rr.get("cache_dir") is not None and not str(rr.get("cache_dir")).strip():
+        raise ValueError("models.reranker.cache_dir must be a non-empty string when provided")
     if not isinstance(rr.get("fp16"), bool):
         raise ValueError("models.reranker.fp16 must be boolean")
 
@@ -292,7 +316,6 @@ def validate_settings(s: SettingsDict) -> None:
         llm = m.get("llm")
         if not isinstance(llm, dict):
             raise ValueError("models.llm must be a mapping (YAML dict) when provided")
-        # If provided, require minimal correctness
         _require_nonempty_str(llm.get("provider"), "models.llm.provider")
         _require_nonempty_str(llm.get("model_name"), "models.llm.model_name")
         _validate_enum(str(llm.get("device")), {"cpu", "cuda"}, "models.llm.device")
