@@ -17,7 +17,6 @@ dependencies = [
   "numpy>=1.26.0",
   "rank-bm25>=0.2.2",
   "whoosh>=2.7.4",
-  "fastapi>=0.110.0",
   "torch>=2.1", 
   "sentence-transformers>=3.0",
   "uvicorn[standard]>=0.27.0",
@@ -42,9 +41,6 @@ dev = [
   "mypy>=1.8.0",
   "types-PyYAML>=6.0.12.20241230",
 ]
-
-[project.scripts]
-rag = "rag_service.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

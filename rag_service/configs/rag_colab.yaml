@@ -38,7 +38,7 @@ models:
     base_model: "BAAI/bge-reranker-v2-m3"
     adapter_path: "/content/drive/MyDrive/rag-kb-data/run1"
     cache_dir: /content/drive/MyDrive/rag-kb-data/data/.hf_cache
-    device: cuda
+    device: cpu
     max_length: 512
     batch_size: 16
 

@@ -1,0 +1,28 @@
+# ----------------------------
+# Force CPU-only PyTorch wheels
+# ----------------------------
+--extra-index-url https://download.pytorch.org/whl/cpu
+
+pyyaml>=6.0.1
+orjson>=3.10.0
+tqdm>=4.66.0
+numpy>=1.26.0
+rank-bm25>=0.2.2
+whoosh>=2.7.4
+
+fastapi>=0.110
+uvicorn[standard]>=0.29
+
+# IMPORTANT: keep torch CPU-only by using the CPU wheel index above
+# Tip: pin a sane range for stability (works well for ECS/Fargate CPU)
+torch>=2.1,<2.6
+sentence-transformers>=3.0
+faiss-cpu>=1.8.0
+
+httpx>=0.27.0
+google-genai>=1.0
+pydantic>=2.6.0
+
+langchain>=0.2.0
+langchain-core>=0.2.0
+langchain-google-genai>=1.0.0
