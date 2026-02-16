@@ -14,3 +14,7 @@ class ChatRequest(BaseModel):
 def chat(req: ChatRequest, request: Request) -> Dict[str, Any]:
     chain = request.app.state.chain
     return chain.invoke(req.query)
+
+@router.get("/healthz")
+def healthz():
+    return {"status": "ok"}

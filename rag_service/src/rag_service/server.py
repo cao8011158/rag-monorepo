@@ -9,7 +9,7 @@ from rag_service.routes import router as api_router
 
 app = FastAPI()
 
-settings = load_settings("configs/rag_awss.yaml")
+settings = load_settings("configs/rag_aws.yaml")
 app.state.chain = build_app_chain(settings)
 
 app.include_router(api_router)

@@ -2,7 +2,7 @@
 set -euo pipefail
 
 DATA_ROOT="${DATA_ROOT:-/data}"
-BUCKET="${S3_BUCKET:-rag-kb-storage-ruoxin-001}"
+BUCKET="${S3_BUCKET:-rag-kb-storage-ruoxin-002}"
 PREFIX="${S3_PREFIX:-rag-kb-data}"
 CONFIG_DST="${CONFIG_DST:-/app/configs}"
 
